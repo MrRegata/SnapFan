@@ -16,7 +16,7 @@ env.Append(
 
 
 def after_build(source, target, env):
-    source_path = Path(str(source[0]))
+    source_path = Path(str(target[0]))
     versioned_name = f"snapfan-esp32c3-v{firmware_version}.bin"
     versioned_path = source_path.with_name(versioned_name)
     shutil.copy2(source_path, versioned_path)
