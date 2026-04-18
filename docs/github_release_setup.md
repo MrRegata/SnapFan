@@ -3,14 +3,18 @@ Publicar en GitHub desde este proyecto
 Botón único en VS Code
 
 1. Pulsa Ctrl+Shift+B.
-2. Elige la versión cuando te la pida.
-3. La tarea Publicar todo a GitHub hará esto sola:
+2. La tarea por defecto Publicar y subir al ESP hará esto sola:
 
+- incrementa automáticamente la versión 0.x.x
 - actualiza custom_firmware_version en platformio.ini
 - hace commit y push del código fuente
 - compila el firmware
 - publica o actualiza la release con el binario OTA
 - genera notas automáticas de release con versión, archivo, commit y fecha
+- sube el firmware al ESP por cable usando PlatformIO
+
+3. Si quieres elegir la versión manualmente, usa la tarea Publicar todo a GitHub.
+
 
 1. Primera vez: sube el código fuente al repo.
 

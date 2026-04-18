@@ -10,6 +10,25 @@
 	],
 	"tasks": [
 		{
+			"label": "Publicar y subir al ESP",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				".\\tools\\publish_all.ps1",
+				"-AutoVersion",
+				"-Upload"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			}
+		},
+		{
 			"label": "Publicar todo a GitHub",
 			"type": "shell",
 			"command": "powershell",
@@ -23,10 +42,7 @@
 			],
 			"isBackground": false,
 			"problemMatcher": [],
-			"group": {
-				"kind": "build",
-				"isDefault": true
-			}
+			"group": "none"
 		},
 		{
 			"label": "Publicar firmware OTA a GitHub",
