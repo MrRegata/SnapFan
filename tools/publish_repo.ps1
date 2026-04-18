@@ -3,7 +3,8 @@ param(
     [string]$Branch = "main",
     [string]$Message = "Initial SnapFan source import",
     [string]$GitName = "",
-    [string]$GitEmail = ""
+    [string]$GitEmail = "",
+    [switch]$SkipPush
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,7 +82,13 @@ if ($hasChanges) {
     Invoke-Native -FilePath "git" -Arguments @("commit", "-m", $Message)
 }
 
-Invoke-Native -FilePath "git" -Arguments @("push", "-u", "origin", $Branch)
+if (-not $SkipPush) {
+    Invoke-Native -FilePath "git" -Arguments @("push", "-u", "origin", $Branch)
+}
 
 Write-Host ""
-Write-Host "Repositorio publicado correctamente en https://github.com/$Repo"
+if ($SkipPush) {
+    Write-Host "Commit local preparado correctamente en $Branch"
+} else {
+    Write-Host "Repositorio publicado correctamente en https://github.com/$Repo"
+}

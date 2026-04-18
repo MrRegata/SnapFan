@@ -1,5 +1,17 @@
 Publicar en GitHub desde este proyecto
 
+Botón único en VS Code
+
+1. Pulsa Ctrl+Shift+B.
+2. Elige la versión cuando te la pida.
+3. La tarea Publicar todo a GitHub hará esto sola:
+
+- actualiza custom_firmware_version en platformio.ini
+- hace commit y push del código fuente
+- compila el firmware
+- publica o actualiza la release con el binario OTA
+- genera notas automáticas de release con versión, archivo, commit y fecha
+
 1. Primera vez: sube el código fuente al repo.
 
 Comando:
@@ -28,6 +40,18 @@ Esto hace:
 - usa el archivo .pio/build/esp32c3/snapfan-esp32c3-vX.Y.Z.bin
 - crea la release vX.Y.Z si no existe
 - o reemplaza el .bin en la release si ya existe
+
+Comando de flujo completo:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\publish_all.ps1 -Version 0.0.1
+```
+
+Esto hace:
+- actualiza la versión en platformio.ini
+- hace commit/push del proyecto con mensaje Release vX.Y.Z
+- compila y publica la release en GitHub
+- genera notas automáticas
 
 3. Cambiar versión.
 

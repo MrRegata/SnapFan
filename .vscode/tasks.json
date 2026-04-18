@@ -1,0 +1,47 @@
+{
+	"version": "2.0.0",
+	"inputs": [
+		{
+			"id": "firmwareVersion",
+			"type": "promptString",
+			"description": "Versión a publicar",
+			"default": "0.0.0"
+		}
+	],
+	"tasks": [
+		{
+			"label": "Publicar todo a GitHub",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				".\\tools\\publish_all.ps1",
+				"-Version",
+				"${input:firmwareVersion}"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			}
+		},
+		{
+			"label": "Publicar firmware OTA a GitHub",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				".\\tools\\publish_release.ps1",
+				"-Build"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "none"
+		}
+	]
+}
