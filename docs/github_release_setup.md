@@ -14,6 +14,7 @@ Botón único en VS Code
 - sube el firmware al ESP por cable usando PlatformIO
 
 3. Si quieres elegir la versión manualmente, usa la tarea Publicar todo a GitHub.
+4. Si quieres publicar una OTA nueva pero sin subir por cable al ESP, usa la tarea Publicar OTA a GitHub.
 
 
 1. Primera vez: sube el código fuente al repo.
@@ -44,6 +45,17 @@ Esto hace:
 - usa el archivo .pio/build/esp32c3/snapfan-esp32c3-vX.Y.Z.bin
 - crea la release vX.Y.Z si no existe
 - o reemplaza el .bin en la release si ya existe
+
+Tarea recomendada para OTA sin cable:
+
+- Publicar OTA a GitHub
+
+Esto hace:
+- incrementa automáticamente la versión 0.x.x
+- hace commit y push del proyecto
+- compila el firmware
+- publica la release OTA
+- no sube el firmware al ESP por cable
 
 Comando de flujo completo:
 

@@ -29,6 +29,21 @@
 			}
 		},
 		{
+			"label": "Publicar OTA a GitHub",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				".\\tools\\publish_all.ps1",
+				"-AutoVersion"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "none"
+		},
+		{
 			"label": "Publicar todo a GitHub",
 			"type": "shell",
 			"command": "powershell",

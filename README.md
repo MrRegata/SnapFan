@@ -30,6 +30,16 @@ La tarea por defecto `Publicar y subir al ESP` hace esto:
 
 Usa la tarea `Publicar todo a GitHub` si quieres escribir la versión manualmente.
 
+### Publicar solo OTA a GitHub
+
+Usa la tarea `Publicar OTA a GitHub` si quieres:
+
+1. subir código al repo
+2. crear o actualizar la release OTA
+3. incrementar la versión automáticamente
+
+pero sin cargar el firmware por cable al ESP.
+
 ## Archivos importantes
 
 - `platformio.ini`: configuración de PlatformIO y versión actual
