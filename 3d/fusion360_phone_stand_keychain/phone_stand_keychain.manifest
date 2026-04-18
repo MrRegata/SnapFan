@@ -1,0 +1,12 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "script",
+  "author": "GitHub Copilot",
+  "description": {
+    "": "Genera un soporte de movil minimalista tipo llavero."
+  },
+  "version": "1.0.0",
+  "supportedOS": "windows|mac",
+  "editEnabled": true,
+  "runOnStartup": false
+}
