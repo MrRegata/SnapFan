@@ -36,7 +36,8 @@ function Set-IniValue {
         throw "No se encontró la clave '$Key' en $Path"
     }
     $updated = [regex]::Replace($content, $pattern, "$Key = $Value", 1)
-    Set-Content -Path $Path -Value $updated -Encoding ASCII
+    $normalized = $updated.TrimEnd("`r", "`n") + "`r`n"
+    [System.IO.File]::WriteAllText($Path, $normalized, [System.Text.Encoding]::ASCII)
 }
 
 function Get-NextVersion {
