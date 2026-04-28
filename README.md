@@ -85,6 +85,7 @@ pero sin cargar el firmware por cable al ESP.
 
 - `platformio.ini`: configuración de PlatformIO y versión actual
 - `src/main.cpp`: firmware principal
+- `docs/flash_esp32.md`: guía para cargar el firmware por cable al ESP32-C3
 - `tools/versioning.py`: crea el `.bin` versionado
 - `tools/publish_repo.ps1`: sube el código fuente al repo
 - `tools/publish_release.ps1`: publica la release del firmware
