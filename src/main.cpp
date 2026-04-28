@@ -81,6 +81,9 @@ const char* NTP_SERVER_2 = "time.google.com";
 #define ADDR_PEAK_MAGIC  162             // uint32_t
 #define ADDR_PEAK_T1     166             // float
 #define ADDR_PEAK_T2     170             // float
+#define LANG_MAGIC       0x4C414E47UL
+#define ADDR_LANG_MAGIC  174             // uint32_t
+#define ADDR_LANG_CODE   178             // char[3]
 // Eliminado: solo 2-pin
 
 // ─── MQTT ─────────────────────────────────────────────────────────────────────
@@ -117,6 +120,8 @@ float temp1 = 0.0f, temp2 = 0.0f;
 float peakTemp1 = -127.0f, peakTemp2 = -127.0f;
 bool  fan1Active = false, fan2Active = false;
 bool  sensor1Valid = false, sensor2Valid = false;
+bool  sensor1Ready = false, sensor2Ready = false;
+char  currentLang[3] = "es";
 
 // ─── Historial de temperatura (últimos 60 lecturas ≈ 3 min) ──────────────────
 #define HIST_SIZE 60
@@ -137,6 +142,48 @@ bool calcAutoFan(float t, float tHigh, float hyst, bool &fanOn) {
     fanOn = false;
   }
   return fanOn;
+}
+
+bool isBootPlaceholderReading(float temperature) {
+  return temperature > 84.5f && temperature < 85.5f;
+}
+
+bool isSupportedLanguageCode(const char* code) {
+  if (!code || code[0] == '\0' || code[1] == '\0' || code[2] != '\0') return false;
+  return strcmp(code, "es") == 0 || strcmp(code, "en") == 0 || strcmp(code, "fr") == 0 ||
+         strcmp(code, "it") == 0 || strcmp(code, "pt") == 0 || strcmp(code, "de") == 0 ||
+         strcmp(code, "zh") == 0;
+}
+
+void setCurrentLanguage(const char* code) {
+  if (isSupportedLanguageCode(code)) {
+    currentLang[0] = code[0];
+    currentLang[1] = code[1];
+  } else {
+    currentLang[0] = 'e';
+    currentLang[1] = 's';
+  }
+  currentLang[2] = '\0';
+}
+
+void loadLanguagePref() {
+  uint32_t magic;
+  EEPROM.get(ADDR_LANG_MAGIC, magic);
+  if (magic != LANG_MAGIC) {
+    setCurrentLanguage("es");
+    return;
+  }
+  char code[3] = {0};
+  for (int i = 0; i < 3; ++i) code[i] = static_cast<char>(EEPROM.read(ADDR_LANG_CODE + i));
+  setCurrentLanguage(code);
+}
+
+void saveLanguagePref(const char* code) {
+  setCurrentLanguage(code);
+  const uint32_t magic = LANG_MAGIC;
+  EEPROM.put(ADDR_LANG_MAGIC, magic);
+  for (int i = 0; i < 3; ++i) EEPROM.write(ADDR_LANG_CODE + i, currentLang[i]);
+  EEPROM.commit();
 }
 
 // ─── EEPROM – WiFi ────────────────────────────────────────────────────────────
@@ -233,7 +280,7 @@ void saveSettings() {
 
 // ─── JSON de estado ───────────────────────────────────────────────────────────
 String buildJson() {
-  String j; j.reserve(640);
+  String j; j.reserve(672);
     const bool wifiConnected = WiFi.status() == WL_CONNECTED;
     const int sensorCount = sensors.getDeviceCount();
     const String wifiSsid = wifiConnected ? WiFi.SSID() : String();
@@ -275,6 +322,7 @@ String buildJson() {
       j += F(",\"s2ok\":"); j += sensor2Valid ? F("true") : F("false");
       j += F(",\"ver\":\""); j += FW_VERSION;
       j += F("\",\"repo\":\""); j += FW_GITHUB_REPO;
+      j += F("\",\"lang\":\""); j += currentLang;
       j += F("\"");
     j += F("}");
     return j;
@@ -354,14 +402,19 @@ button:hover{background:#2563eb}
   </div>
   <div class="sub">Conectado al punto de acceso de configuraci&oacute;n</div>
   <form method="POST" action="/savewifi">
-    <label>Red WiFi (SSID)</label>
-    <input type="text" name="ssid" maxlength="32" required autocomplete="off" placeholder="Nombre de tu red WiFi">
-    <label>Contrase&ntilde;a</label>
-    <input type="password" name="pass" maxlength="64" autocomplete="off" placeholder="Dejar vac&iacute;o si la red es abierta">
-    <button type="submit">&#128274; Guardar y Conectar</button>
+    <label id="apLblSsid">Red WiFi (SSID)</label>
+    <input type="text" id="apSsidInput" name="ssid" maxlength="32" required autocomplete="off" placeholder="Nombre de tu red WiFi">
+    <label id="apLblPass">Contrase&ntilde;a</label>
+    <input type="password" id="apPassInput" name="pass" maxlength="64" autocomplete="off" placeholder="Dejar vac&iacute;o si la red es abierta">
+    <button type="submit" id="apSaveBtn">&#128274; Guardar y Conectar</button>
   </form>
-  <div class="note">El ESP se reiniciar&aacute; e intentar&aacute; conectar a tu red.<br>Si falla, volver&aacute; a modo AP autom&aacute;ticamente.</div>
-</div></body></html>
+  <div class="note" id="apNote">El ESP se reiniciar&aacute; e intentar&aacute; conectar a tu red.<br>Si falla, volver&aacute; a modo AP autom&aacute;ticamente.</div>
+</div>
+<script>
+const AP_TR={es:{title:'SnapFan – Setup',sub:'Conectado al punto de acceso de configuración',ssid:'Red WiFi (SSID)',ssidPh:'Nombre de tu red WiFi',pass:'Contraseña',passPh:'Dejar vacío si la red es abierta',save:'🔒 Guardar y Conectar',note:'El ESP se reiniciará e intentará conectar a tu red.<br>Si falla, volverá a modo AP automáticamente.'},en:{title:'SnapFan – Setup',sub:'Connected to the configuration access point',ssid:'WiFi network (SSID)',ssidPh:'Your WiFi network name',pass:'Password',passPh:'Leave empty if the network is open',save:'🔒 Save and Connect',note:'The ESP will restart and try to connect to your network.<br>If it fails, it will return to AP mode automatically.'},fr:{title:'SnapFan – Configuration',sub:'Connecté au point d\'accès de configuration',ssid:'Réseau WiFi (SSID)',ssidPh:'Nom de votre réseau WiFi',pass:'Mot de passe',passPh:'Laisser vide si le réseau est ouvert',save:'🔒 Enregistrer et connecter',note:'L\'ESP redémarrera et essaiera de se connecter à votre réseau.<br>En cas d\'échec, il reviendra automatiquement en mode AP.'},it:{title:'SnapFan – Configurazione',sub:'Connesso al punto di accesso di configurazione',ssid:'Rete WiFi (SSID)',ssidPh:'Nome della tua rete WiFi',pass:'Password',passPh:'Lascia vuoto se la rete è aperta',save:'🔒 Salva e collega',note:'L\'ESP si riavvierà e proverà a collegarsi alla tua rete.<br>Se fallisce, tornerà automaticamente in modalità AP.'},pt:{title:'SnapFan – Configuração',sub:'Ligado ao ponto de acesso de configuração',ssid:'Rede WiFi (SSID)',ssidPh:'Nome da tua rede WiFi',pass:'Palavra-passe',passPh:'Deixa vazio se a rede for aberta',save:'🔒 Guardar e Ligar',note:'O ESP vai reiniciar e tentar ligar-se à tua rede.<br>Se falhar, voltará automaticamente ao modo AP.'},de:{title:'SnapFan – Einrichtung',sub:'Mit dem Konfigurationszugangspunkt verbunden',ssid:'WiFi-Netzwerk (SSID)',ssidPh:'Name Ihres WiFi-Netzwerks',pass:'Passwort',passPh:'Leer lassen, wenn das Netzwerk offen ist',save:'🔒 Speichern und Verbinden',note:'Der ESP startet neu und versucht, sich mit Ihrem Netzwerk zu verbinden.<br>Falls es fehlschlägt, kehrt er automatisch in den AP-Modus zurück.'},zh:{title:'SnapFan – 设置',sub:'已连接到配置接入点',ssid:'WiFi 网络 (SSID)',ssidPh:'你的 WiFi 网络名称',pass:'密码',passPh:'如果网络开放请留空',save:'🔒 保存并连接',note:'ESP 将重启并尝试连接你的网络。<br>如果失败，它会自动返回 AP 模式。'}};
+function apSetLang(lang){const t=AP_TR[lang]||AP_TR.es;document.documentElement.lang=lang;document.querySelector('.hdr h1').textContent=t.title;document.querySelector('.sub').textContent=t.sub;document.getElementById('apLblSsid').textContent=t.ssid;document.getElementById('apSsidInput').placeholder=t.ssidPh;document.getElementById('apLblPass').textContent=t.pass;document.getElementById('apPassInput').placeholder=t.passPh;document.getElementById('apSaveBtn').textContent=t.save;document.getElementById('apNote').innerHTML=t.note;}
+fetch('/status').then(r=>r.json()).then(d=>apSetLang(d.lang||'es')).catch(()=>apSetLang('es'));
+</script></body></html>
 )rawliteral";
 
 // ─── OTA Page ─────────────────────────────────────────────────────────────────
@@ -400,7 +453,7 @@ body{font-family:'Segoe UI',sans-serif;background:#111827;color:#e2e8f0;min-heig
 .note{font-size:.72rem;color:#475569;text-align:center;margin-top:14px;line-height:1.5}
 </style></head><body>
 <div class="topbar">
-  <a href="/" class="back-btn">&#8592; Volver</a>
+  <a href="/" class="back-btn" id="otaBackBtn">&#8592; Volver</a>
   <div class="hdr">
     <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
       <rect x="8" y="44" width="48" height="12" rx="3" fill="#1e3a5f" stroke="#60a5fa" stroke-width="2"/>
@@ -413,18 +466,18 @@ body{font-family:'Segoe UI',sans-serif;background:#111827;color:#e2e8f0;min-heig
       <circle cx="32" cy="10" r="3" fill="#fb923c"/>
       <circle cx="42" cy="10" r="3" fill="#4ade80"/>
     </svg>
-    <span class="htitle">SnapFan &ndash; OTA Update</span>
+    <span class="htitle" id="otaTitle">SnapFan &ndash; OTA Update</span>
   </div>
   <div style="width:80px"></div>
 </div>
 <div class="card">
-  <h2>&#128230; Actualizaci&oacute;n de Firmware</h2>
+  <h2 id="otaHeading">&#128230; Actualizaci&oacute;n de Firmware</h2>
   <div class="dropzone" id="dz" onclick="document.getElementById('fw').click()">
     <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="1.5">
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
       <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
     </svg>
-    <p>Arrastra el archivo <span>.bin</span> aqu&iacute;<br>o haz clic para seleccionar</p>
+    <p id="otaDropText">Arrastra el archivo <span>.bin</span> aqu&iacute;<br>o haz clic para seleccionar</p>
   </div>
   <input type="file" id="fw" accept=".bin" style="display:none">
   <div id="fileInfo"><div class="fname" id="fname"></div><div class="fsize" id="fsize"></div></div>
@@ -435,12 +488,16 @@ body{font-family:'Segoe UI',sans-serif;background:#111827;color:#e2e8f0;min-heig
       <polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/>
       <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
     </svg>
-    Subir Firmware
+    <span id="otaUploadBtnText">Subir Firmware</span>
   </button>
   <div class="result" id="res"></div>
-  <div class="note">&#9888;&#65039; El ESP se reiniciar&aacute; autom&aacute;ticamente al terminar.<br>No cierres esta p&aacute;gina hasta que finalice la carga.</div>
+  <div class="note" id="otaNote">&#9888;&#65039; El ESP se reiniciar&aacute; autom&aacute;ticamente al terminar.<br>No cierres esta p&aacute;gina hasta que finalice la carga.</div>
 </div>
 <script>
+const OTA_TR={es:{back:'← Volver',title:'SnapFan – OTA Update',heading:'📦 Actualización de Firmware',drop:'Arrastra el archivo <span>.bin</span> aquí<br>o haz clic para seleccionar',upload:'Subir Firmware',note:'⚠️ El ESP se reiniciará automáticamente al terminar.<br>No cierres esta página hasta que finalice la carga.',uploaded:'✓ Firmware cargado. Reiniciando...',error:'✗ Error: ',conn:'✗ Error de conexión'},en:{back:'← Back',title:'SnapFan – OTA Update',heading:'📦 Firmware Update',drop:'Drag the <span>.bin</span> file here<br>or click to select it',upload:'Upload Firmware',note:'⚠️ The ESP will restart automatically when finished.<br>Do not close this page until the upload completes.',uploaded:'✓ Firmware uploaded. Restarting...',error:'✗ Error: ',conn:'✗ Connection error'},fr:{back:'← Retour',title:'SnapFan – Mise à jour OTA',heading:'📦 Mise à jour du firmware',drop:'Glissez le fichier <span>.bin</span> ici<br>ou cliquez pour le sélectionner',upload:'Téléverser le firmware',note:'⚠️ L\'ESP redémarrera automatiquement à la fin.<br>Ne fermez pas cette page avant la fin du transfert.',uploaded:'✓ Firmware téléversé. Redémarrage...',error:'✗ Erreur : ',conn:'✗ Erreur de connexion'},it:{back:'← Indietro',title:'SnapFan – Aggiornamento OTA',heading:'📦 Aggiornamento firmware',drop:'Trascina qui il file <span>.bin</span><br>oppure fai clic per selezionarlo',upload:'Carica firmware',note:'⚠️ L\'ESP si riavvierà automaticamente al termine.<br>Non chiudere questa pagina fino al completamento del caricamento.',uploaded:'✓ Firmware caricato. Riavvio...',error:'✗ Errore: ',conn:'✗ Errore di connessione'},pt:{back:'← Voltar',title:'SnapFan – Atualização OTA',heading:'📦 Atualização de Firmware',drop:'Arrasta o ficheiro <span>.bin</span> para aqui<br>ou clica para o selecionar',upload:'Carregar Firmware',note:'⚠️ O ESP vai reiniciar automaticamente no fim.<br>Não feches esta página até a carga terminar.',uploaded:'✓ Firmware carregado. A reiniciar...',error:'✗ Erro: ',conn:'✗ Erro de ligação'},de:{back:'← Zurück',title:'SnapFan – OTA-Update',heading:'📦 Firmware-Aktualisierung',drop:'Ziehen Sie die <span>.bin</span>-Datei hierher<br>oder klicken Sie zum Auswählen',upload:'Firmware hochladen',note:'⚠️ Der ESP startet nach Abschluss automatisch neu.<br>Schließen Sie diese Seite nicht, bevor der Upload fertig ist.',uploaded:'✓ Firmware hochgeladen. Neustart...',error:'✗ Fehler: ',conn:'✗ Verbindungsfehler'},zh:{back:'← 返回',title:'SnapFan – OTA 更新',heading:'📦 固件更新',drop:'将 <span>.bin</span> 文件拖到这里<br>或点击选择文件',upload:'上传固件',note:'⚠️ ESP 完成后会自动重启。<br>在上传结束前请不要关闭此页面。',uploaded:'✓ 固件已上传，正在重启...',error:'✗ 错误：',conn:'✗ 连接错误'}};
+let OTA_LG='es';
+function otaT(key){return (OTA_TR[OTA_LG]||OTA_TR.es)[key]||key;}
+function otaSetLang(lang){OTA_LG=OTA_TR[lang]?lang:'es';document.documentElement.lang=OTA_LG;document.getElementById('otaBackBtn').textContent=otaT('back');document.getElementById('otaTitle').textContent=otaT('title');document.getElementById('otaHeading').innerHTML=otaT('heading');document.getElementById('otaDropText').innerHTML=otaT('drop');document.getElementById('otaUploadBtnText').textContent=otaT('upload');document.getElementById('otaNote').innerHTML=otaT('note');}
 const dz=document.getElementById('dz'),fw=document.getElementById('fw');
 const fi=document.getElementById('fileInfo'),fn=document.getElementById('fname'),fs=document.getElementById('fsize');
 const pw=document.getElementById('pw'),pb=document.getElementById('pb'),pct=document.getElementById('pct');
@@ -469,12 +526,13 @@ function doUpload(){
   };
   xhr.onload=()=>{
     res.style.display='block';
-    if(xhr.status==200){res.className='result ok';res.textContent='✓ Firmware cargado. Reiniciando...';}
-    else{res.className='result err';res.textContent='✗ Error: '+xhr.responseText;}
+    if(xhr.status==200){res.className='result ok';res.textContent=otaT('uploaded');}
+    else{res.className='result err';res.textContent=otaT('error')+xhr.responseText;}
   };
-  xhr.onerror=()=>{res.style.display='block';res.className='result err';res.textContent='✗ Error de conexi\u00f3n';};
+  xhr.onerror=()=>{res.style.display='block';res.className='result err';res.textContent=otaT('conn');};
   upbtn.disabled=true; xhr.send(fd);
 }
+fetch('/status').then(r=>r.json()).then(d=>otaSetLang(d.lang||'es')).catch(()=>otaSetLang('es'));
 </script>
 </body></html>
 )rawliteral";
@@ -496,7 +554,7 @@ body{font-family:'Segoe UI',sans-serif;background:radial-gradient(circle at top,
 <div class="shell">
   <div class="top">
     <a class="back" href="/" id="backBtn">&#8592; Volver al panel</a>
-    <select class="lang" id="langSel" onchange="setLang(this.value)"><option value="es">🇪🇸 ES</option><option value="en">🇬🇧 EN</option></select>
+    <select class="lang" id="langSel" onchange="setLang(this.value)"><option value="es">🇪🇸 ES</option><option value="en">🇬🇧 EN</option><option value="fr">🇫🇷 FR</option><option value="it">🇮🇹 IT</option><option value="pt">🇵🇹 PT</option><option value="de">🇩🇪 DE</option><option value="zh">🇨🇳 中文</option></select>
   </div>
   <section class="hero">
     <div class="eyebrow" id="heroEyebrow">Administrador WiFi</div>
@@ -533,21 +591,23 @@ body{font-family:'Segoe UI',sans-serif;background:radial-gradient(circle at top,
   </div>
 </div>
 <script>
-const TR={es:{back:'\u2190 Volver al panel',eyebrow:'Administrador WiFi',title:'Conecta SnapFan a otra red',hero:'Pulsa en una red detectada para rellenar el SSID, introduce la contraseña si hace falta y guarda. El equipo reiniciará para conectarse.',ssidNow:'SSID actual',ipNow:'IP actual',signal:'Señal',host:'Host',clock:'Hora',sync:'NTP',scanTitle:'Redes detectadas',scanBtn:'Escanear de nuevo',scanIdle:'Selecciona una red o lanza un nuevo escaneo.',scanRun:'Buscando redes WiFi cercanas...',scanNone:'No se han encontrado redes visibles.',scanErr:'No se pudo escanear ahora mismo.',formTitle:'Conectar a la red',lblSsid:'SSID',lblPass:'Contraseña',save:'Guardar y reconectar',note:'Si la red es abierta, deja la contraseña vacía. Al guardar, el ESP32-C3 reiniciará e intentará enlazar con esa red.',selectHint:'Red seleccionada',open:'Abierta',secure:'Protegida',saved:'WiFi guardado. Reiniciando...',saveErr:'No se pudo guardar la nueva WiFi.',ssidReq:'Introduce el SSID',noWifi:'Sin WiFi',noTime:'Sin hora',synced:'Sincronizada',unsynced:'Pendiente',dayClock:'Hora local'},en:{back:'\u2190 Back to dashboard',eyebrow:'WiFi manager',title:'Connect SnapFan to another network',hero:'Tap a detected network to fill the SSID, enter the password if needed, and save. The device will reboot and reconnect.',ssidNow:'Current SSID',ipNow:'Current IP',signal:'Signal',host:'Host',clock:'Time',sync:'NTP',scanTitle:'Detected networks',scanBtn:'Scan again',scanIdle:'Select a network or start a new scan.',scanRun:'Scanning nearby WiFi networks...',scanNone:'No visible networks were found.',scanErr:'WiFi scan failed right now.',formTitle:'Connect to network',lblSsid:'SSID',lblPass:'Password',save:'Save and reconnect',note:'If the network is open, leave the password empty. After saving, the ESP32-C3 will reboot and try to join that network.',selectHint:'Selected network',open:'Open',secure:'Secured',saved:'WiFi saved. Restarting...',saveErr:'Could not save the new WiFi.',ssidReq:'Enter SSID',noWifi:'No WiFi',noTime:'No time',synced:'Synced',unsynced:'Pending',dayClock:'Local time'}};
-let LG=localStorage.getItem('lang')||'es';
+const TR={es:{back:'\u2190 Volver al panel',eyebrow:'Administrador WiFi',title:'Conecta SnapFan a otra red',hero:'Pulsa en una red detectada para rellenar el SSID, introduce la contraseña si hace falta y guarda. El equipo reiniciará para conectarse.',ssidNow:'SSID actual',ipNow:'IP actual',signal:'Señal',host:'Host',clock:'Hora',sync:'NTP',scanTitle:'Redes detectadas',scanBtn:'Escanear de nuevo',scanIdle:'Selecciona una red o lanza un nuevo escaneo.',scanRun:'Buscando redes WiFi cercanas...',scanNone:'No se han encontrado redes visibles.',scanErr:'No se pudo escanear ahora mismo.',formTitle:'Conectar a la red',lblSsid:'SSID',lblPass:'Contraseña',save:'Guardar y reconectar',note:'Si la red es abierta, deja la contraseña vacía. Al guardar, el ESP32-C3 reiniciará e intentará enlazar con esa red.',selectHint:'Red seleccionada',open:'Abierta',secure:'Protegida',saved:'WiFi guardado. Reiniciando...',saveErr:'No se pudo guardar la nueva WiFi.',ssidReq:'Introduce el SSID',noWifi:'Sin WiFi',noTime:'Sin hora',synced:'Sincronizada',unsynced:'Pendiente',dayClock:'Hora local'},en:{back:'\u2190 Back to dashboard',eyebrow:'WiFi manager',title:'Connect SnapFan to another network',hero:'Tap a detected network to fill the SSID, enter the password if needed, and save. The device will reboot and reconnect.',ssidNow:'Current SSID',ipNow:'Current IP',signal:'Signal',host:'Host',clock:'Time',sync:'NTP',scanTitle:'Detected networks',scanBtn:'Scan again',scanIdle:'Select a network or start a new scan.',scanRun:'Scanning nearby WiFi networks...',scanNone:'No visible networks were found.',scanErr:'WiFi scan failed right now.',formTitle:'Connect to network',lblSsid:'SSID',lblPass:'Password',save:'Save and reconnect',note:'If the network is open, leave the password empty. After saving, the ESP32-C3 will reboot and try to join that network.',selectHint:'Selected network',open:'Open',secure:'Secured',saved:'WiFi saved. Restarting...',saveErr:'Could not save the new WiFi.',ssidReq:'Enter SSID',noWifi:'No WiFi',noTime:'No time',synced:'Synced',unsynced:'Pending',dayClock:'Local time'},fr:{back:'\u2190 Retour au tableau de bord',eyebrow:'Gestionnaire WiFi',title:'Connecter SnapFan à un autre réseau',hero:'Touchez un réseau détecté pour remplir le SSID, saisissez le mot de passe si nécessaire, puis enregistrez. L\'appareil redémarrera et se reconnectera.',ssidNow:'SSID actuel',ipNow:'IP actuelle',signal:'Signal',host:'Hôte',clock:'Heure',sync:'NTP',scanTitle:'Réseaux détectés',scanBtn:'Relancer le scan',scanIdle:'Sélectionnez un réseau ou lancez un nouveau scan.',scanRun:'Recherche des réseaux WiFi à proximité...',scanNone:'Aucun réseau visible trouvé.',scanErr:'Impossible de lancer le scan WiFi pour le moment.',formTitle:'Se connecter au réseau',lblSsid:'SSID',lblPass:'Mot de passe',save:'Enregistrer et reconnecter',note:'Si le réseau est ouvert, laissez le mot de passe vide. Après l\'enregistrement, l\'ESP32-C3 redémarrera et essaiera de rejoindre ce réseau.',selectHint:'Réseau sélectionné',open:'Ouvert',secure:'Sécurisé',saved:'WiFi enregistré. Redémarrage...',saveErr:'Impossible d\'enregistrer le nouveau WiFi.',ssidReq:'Saisissez le SSID',noWifi:'Pas de WiFi',noTime:'Pas d\'heure',synced:'Synchronisé',unsynced:'En attente',dayClock:'Heure locale'},it:{back:'\u2190 Torna al pannello',eyebrow:'Gestore WiFi',title:'Collega SnapFan a un\'altra rete',hero:'Tocca una rete rilevata per compilare l\'SSID, inserisci la password se necessaria e salva. Il dispositivo si riavvierà e si ricollegherà.',ssidNow:'SSID attuale',ipNow:'IP attuale',signal:'Segnale',host:'Host',clock:'Ora',sync:'NTP',scanTitle:'Reti rilevate',scanBtn:'Scansiona di nuovo',scanIdle:'Seleziona una rete o avvia una nuova scansione.',scanRun:'Scansione delle reti WiFi vicine...',scanNone:'Nessuna rete visibile trovata.',scanErr:'Impossibile eseguire la scansione WiFi in questo momento.',formTitle:'Connetti alla rete',lblSsid:'SSID',lblPass:'Password',save:'Salva e riconnetti',note:'Se la rete è aperta, lascia vuota la password. Dopo il salvataggio, l\'ESP32-C3 si riavvierà e proverà a collegarsi a quella rete.',selectHint:'Rete selezionata',open:'Aperta',secure:'Protetta',saved:'WiFi salvato. Riavvio...',saveErr:'Impossibile salvare il nuovo WiFi.',ssidReq:'Inserisci l\'SSID',noWifi:'Nessun WiFi',noTime:'Nessuna ora',synced:'Sincronizzato',unsynced:'In attesa',dayClock:'Ora locale'},pt:{back:'\u2190 Voltar ao painel',eyebrow:'Gestor de WiFi',title:'Ligar o SnapFan a outra rede',hero:'Toque numa rede detetada para preencher o SSID, introduza a palavra-passe se necessário e guarde. O dispositivo vai reiniciar e voltar a ligar-se.',ssidNow:'SSID atual',ipNow:'IP atual',signal:'Sinal',host:'Host',clock:'Hora',sync:'NTP',scanTitle:'Redes detetadas',scanBtn:'Pesquisar novamente',scanIdle:'Selecione uma rede ou inicie uma nova pesquisa.',scanRun:'A procurar redes WiFi próximas...',scanNone:'Não foram encontradas redes visíveis.',scanErr:'Não foi possível pesquisar WiFi agora.',formTitle:'Ligar à rede',lblSsid:'SSID',lblPass:'Palavra-passe',save:'Guardar e voltar a ligar',note:'Se a rede estiver aberta, deixe a palavra-passe vazia. Após guardar, o ESP32-C3 vai reiniciar e tentar ligar-se a essa rede.',selectHint:'Rede selecionada',open:'Aberta',secure:'Protegida',saved:'WiFi guardado. A reiniciar...',saveErr:'Não foi possível guardar o novo WiFi.',ssidReq:'Introduza o SSID',noWifi:'Sem WiFi',noTime:'Sem hora',synced:'Sincronizado',unsynced:'Pendente',dayClock:'Hora local'},de:{back:'\u2190 Zurück zum Dashboard',eyebrow:'WiFi-Verwaltung',title:'SnapFan mit einem anderen Netzwerk verbinden',hero:'Wählen Sie ein erkanntes Netzwerk aus, um die SSID zu übernehmen, geben Sie bei Bedarf das Passwort ein und speichern Sie. Das Gerät startet neu und verbindet sich erneut.',ssidNow:'Aktuelle SSID',ipNow:'Aktuelle IP',signal:'Signal',host:'Host',clock:'Uhrzeit',sync:'NTP',scanTitle:'Erkannte Netzwerke',scanBtn:'Erneut scannen',scanIdle:'Wählen Sie ein Netzwerk oder starten Sie einen neuen Scan.',scanRun:'Suche nach verfügbaren WLAN-Netzwerken...',scanNone:'Keine sichtbaren Netzwerke gefunden.',scanErr:'WLAN-Scan konnte gerade nicht ausgeführt werden.',formTitle:'Mit Netzwerk verbinden',lblSsid:'SSID',lblPass:'Passwort',save:'Speichern und neu verbinden',note:'Wenn das Netzwerk offen ist, lassen Sie das Passwort leer. Nach dem Speichern startet der ESP32-C3 neu und versucht, sich mit diesem Netzwerk zu verbinden.',selectHint:'Ausgewähltes Netzwerk',open:'Offen',secure:'Geschützt',saved:'WiFi gespeichert. Neustart...',saveErr:'Das neue WiFi konnte nicht gespeichert werden.',ssidReq:'SSID eingeben',noWifi:'Kein WiFi',noTime:'Keine Uhrzeit',synced:'Synchronisiert',unsynced:'Ausstehend',dayClock:'Ortszeit'},zh:{back:'\u2190 返回面板',eyebrow:'WiFi 管理',title:'将 SnapFan 连接到其他网络',hero:'点击已检测到的网络以填入 SSID，如有需要请输入密码并保存。设备将重启并重新连接。',ssidNow:'当前 SSID',ipNow:'当前 IP',signal:'信号',host:'主机',clock:'时间',sync:'NTP',scanTitle:'检测到的网络',scanBtn:'重新扫描',scanIdle:'请选择一个网络或重新开始扫描。',scanRun:'正在扫描附近的 WiFi 网络...',scanNone:'未找到可见网络。',scanErr:'当前无法执行 WiFi 扫描。',formTitle:'连接到网络',lblSsid:'SSID',lblPass:'密码',save:'保存并重新连接',note:'如果网络是开放的，请将密码留空。保存后，ESP32-C3 将重启并尝试连接该网络。',selectHint:'已选网络',open:'开放',secure:'受保护',saved:'WiFi 已保存，正在重启...',saveErr:'无法保存新的 WiFi。',ssidReq:'请输入 SSID',noWifi:'无 WiFi',noTime:'无时间',synced:'已同步',unsynced:'等待中',dayClock:'本地时间'}};
+const LOCALE_MAP={es:'es-ES',en:'en-GB',fr:'fr-FR',it:'it-IT',pt:'pt-PT',de:'de-DE',zh:'zh-CN'};
+let LG=TR[localStorage.getItem('lang')]?localStorage.getItem('lang'):'es';
 let scanResults=[];
 function t(k){return TR[LG][k]||k;}
 function showToast(msg,kind){const el=document.getElementById('toast');el.textContent=msg;el.className='toast show '+kind;}
 function clearToast(){const el=document.getElementById('toast');el.className='toast';el.textContent='';}
-function formatClock(epoch){if(!epoch)return t('noTime');const loc=LG==='es'?'es-ES':'en-GB';return new Date(epoch*1000).toLocaleString(loc,{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+function formatClock(epoch){if(!epoch)return t('noTime');const loc=LOCALE_MAP[LG]||'es-ES';return new Date(epoch*1000).toLocaleString(loc,{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'});}
 function formatSignal(rssi){if(typeof rssi!=='number'||rssi<=-126)return '--';const quality=Math.max(0,Math.min(100,Math.round(2*(rssi+100))));return rssi+' dBm · '+quality+'%';}
 function securityLabel(secure){return secure?t('secure'):t('open');}
 function renderNetworks(){const host=document.getElementById('scanList');host.innerHTML='';if(!scanResults.length){document.getElementById('scanMsg').textContent=t('scanNone');return;}document.getElementById('scanMsg').textContent=t('scanIdle');const selected=document.getElementById('ssidInput').value.trim();scanResults.forEach(net=>{const row=document.createElement('button');row.type='button';row.className='net'+(selected===net.ssid?' sel':'');row.onclick=()=>selectNetwork(net);const left=document.createElement('div');const name=document.createElement('div');name.className='netname';name.textContent=net.ssid||'(hidden)';const meta=document.createElement('div');meta.className='netmeta';meta.innerHTML='<span class="pill">📶 '+formatSignal(net.rssi)+'</span><span class="pill '+(net.secure?'sec':'open')+'">'+securityLabel(net.secure)+'</span><span class="pill">CH '+net.channel+'</span>';left.appendChild(name);left.appendChild(meta);const right=document.createElement('div');right.className='pill';right.textContent=t('selectHint');row.appendChild(left);row.appendChild(right);host.appendChild(row);});}
 function selectNetwork(net){document.getElementById('ssidInput').value=net.ssid||'';document.getElementById('passInput').focus();renderNetworks();clearToast();}
 async function scanWifi(){clearToast();document.getElementById('scanMsg').textContent=t('scanRun');document.getElementById('scanList').innerHTML='';try{const res=await fetch('/wifi/scan');if(!res.ok)throw new Error('scan');const data=await res.json();scanResults=(data.nets||[]).filter(net=>net.ssid);renderNetworks();}catch(e){scanResults=[];renderNetworks();document.getElementById('scanMsg').textContent=t('scanErr');showToast(t('scanErr'),'err');}}
-async function loadStatus(){try{const d=await(await fetch('/status')).json();document.getElementById('curSsid').textContent=d.ssid||t('noWifi');document.getElementById('curIp').textContent=d.ip||'--';document.getElementById('curSignal').textContent=formatSignal(Number(d.rssi));document.getElementById('curHost').textContent=d.host||'--';document.getElementById('curClock').textContent=formatClock(parseInt(d.epoch)||0);document.getElementById('curSync').textContent=d.ntp?t('synced'):t('unsynced');}catch(e){}}
+async function persistLang(lang){try{await fetch('/setlang?lang='+encodeURIComponent(lang));}catch(e){}}
+async function loadStatus(){try{const d=await(await fetch('/status')).json();if(d.lang&&TR[d.lang]&&d.lang!==LG){setLang(d.lang,false,false);}document.getElementById('curSsid').textContent=d.ssid||t('noWifi');document.getElementById('curIp').textContent=d.ip||'--';document.getElementById('curSignal').textContent=formatSignal(Number(d.rssi));document.getElementById('curHost').textContent=d.host||'--';document.getElementById('curClock').textContent=formatClock(parseInt(d.epoch)||0);document.getElementById('curSync').textContent=d.ntp?t('synced'):t('unsynced');}catch(e){}}
 async function saveWifi(){const ssid=document.getElementById('ssidInput').value.trim();const pass=document.getElementById('passInput').value;if(!ssid){showToast(t('ssidReq'),'err');return;}try{const res=await fetch('/savewifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass)+'&noreset=1'});if(!res.ok)throw new Error('save');showToast(t('saved'),'ok');setTimeout(()=>{window.location='/';},2500);}catch(e){showToast(t('saveErr'),'err');}}
-function setLang(lang){LG=lang;localStorage.setItem('lang',lang);document.documentElement.lang=lang;document.getElementById('langSel').value=lang;document.getElementById('backBtn').textContent=t('back');document.getElementById('heroEyebrow').textContent=t('eyebrow');document.getElementById('heroTitle').textContent=t('title');document.getElementById('heroText').textContent=t('hero');document.getElementById('kSsid').textContent=t('ssidNow');document.getElementById('kIp').textContent=t('ipNow');document.getElementById('kSignal').textContent=t('signal');document.getElementById('kHost').textContent=t('host');document.getElementById('kClock').textContent=t('clock');document.getElementById('kSync').textContent=t('sync');document.getElementById('scanTitle').textContent=t('scanTitle');document.getElementById('scanBtn').textContent=t('scanBtn');document.getElementById('formTitle').textContent=t('formTitle');document.getElementById('lblSsid').textContent=t('lblSsid');document.getElementById('lblPass').textContent=t('lblPass');document.getElementById('saveBtn').textContent=t('save');document.getElementById('wifiNote').textContent=t('note');renderNetworks();loadStatus();if(!scanResults.length){document.getElementById('scanMsg').textContent=t('scanRun');}}
+function setLang(lang,persist=true,refreshStatus=true){LG=TR[lang]?lang:'es';localStorage.setItem('lang',LG);document.documentElement.lang=LG;document.getElementById('langSel').value=LG;document.getElementById('backBtn').textContent=t('back');document.getElementById('heroEyebrow').textContent=t('eyebrow');document.getElementById('heroTitle').textContent=t('title');document.getElementById('heroText').textContent=t('hero');document.getElementById('kSsid').textContent=t('ssidNow');document.getElementById('kIp').textContent=t('ipNow');document.getElementById('kSignal').textContent=t('signal');document.getElementById('kHost').textContent=t('host');document.getElementById('kClock').textContent=t('clock');document.getElementById('kSync').textContent=t('sync');document.getElementById('scanTitle').textContent=t('scanTitle');document.getElementById('scanBtn').textContent=t('scanBtn');document.getElementById('formTitle').textContent=t('formTitle');document.getElementById('lblSsid').textContent=t('lblSsid');document.getElementById('lblPass').textContent=t('lblPass');document.getElementById('saveBtn').textContent=t('save');document.getElementById('wifiNote').textContent=t('note');renderNetworks();if(refreshStatus)loadStatus();if(!scanResults.length){document.getElementById('scanMsg').textContent=t('scanRun');}if(persist)persistLang(LG);}
 window.addEventListener('load',()=>{setLang(LG);loadStatus();scanWifi();});
 </script></body></html>
 )rawliteral";
@@ -586,7 +646,7 @@ footer{text-align:center;color:#475569;font-size:.66rem;margin-top:16px}
     <div class="topnet-item"><div class="topnet-k" id="lblNetTime">Hora</div><div class="topnet-v" id="netTime">--:--:--</div></div>
   </div>
   <div class="topright">
-    <select class="langsel" id="langSel" onchange="setLang(this.value)"><option value="es">🇪🇸 ES</option><option value="en">🇬🇧 EN</option></select>
+    <select class="langsel" id="langSel" onchange="setLang(this.value)"><option value="es">🇪🇸 ES</option><option value="en">🇬🇧 EN</option><option value="fr">🇫🇷 FR</option><option value="it">🇮🇹 IT</option><option value="pt">🇵🇹 PT</option><option value="de">🇩🇪 DE</option><option value="zh">🇨🇳 中文</option></select>
     <button class="tbtn green" onclick="checkForUpdates(true)" id="btnUpdates"><span class="btn-ico">⬇️</span><span>Updates</span></button>
     <button class="tbtn blue" onclick="showOTA()" id="btnOTA"><span class="btn-ico">📦</span><span>OTA</span></button>
     <button class="tbtn orange" onclick="openWifiPage()" id="btnWifi"><span class="btn-ico">📶</span><span>WiFi</span></button>
@@ -616,25 +676,28 @@ footer{text-align:center;color:#475569;font-size:.66rem;margin-top:16px}
     <form onsubmit="saveZone(event,2)"><div class="sec" style="border-top:none;padding-top:8px"><div class="st" id="lblAuto2">Control autom&aacute;tico</div><div class="r2"><div><label id="lblTHigh2">Umbral ON (&deg;C)</label><input type="number" id="z2th" min="20" max="90" step="0.5" value="50"></div><div><label id="lblHyst2">Hist&eacute;resis (&deg;C)</label><input type="number" id="z2hy" min="1" max="20" step="0.5" value="10"></div></div></div><div class="sec"><div class="st" id="lblManual2">Control manual</div><div class="power-actions"><button type="button" class="power-btn power-on" id="z2on" onclick="setManual(2,1)">Encender</button><button type="button" class="power-btn power-off" id="z2off" onclick="setManual(2,0)">Apagar</button></div></div><button class="sv2" type="submit" id="btnSaveZ2">Guardar Zona 2</button></form>
   </div>
 </div>
-<div class="overlay" id="otaOverlay"><div class="modal"><p id="otaMsg">Abriendo p&aacute;gina OTA...</p><div class="modal-btns"><button style="background:#1d4ed8;color:#fff" onclick="window.location='/update';hideOTA()">Ir a OTA</button><button style="background:#374151;color:#e2e8f0" onclick="hideOTA()">Cancelar</button></div></div></div>
-<div class="overlay" id="peakOverlay"><div class="modal"><p id="peakMsg">&iquest;Borrar T. m&aacute;x registradas?</p><div class="modal-btns"><button style="background:#16a34a;color:#fff" onclick="doResetPeak()">S&iacute;</button><button style="background:#374151;color:#e2e8f0" onclick="hidePeakRst()">No</button></div></div></div>
-<div class="overlay" id="rstOverlay"><div class="modal"><p id="rstMsg">&iquest;Reiniciar el ESP ahora?</p><div class="modal-btns"><button style="background:#dc2626;color:#fff" onclick="doRestart()">S&iacute;</button><button style="background:#374151;color:#e2e8f0" onclick="hideRst()">No</button></div></div></div>
+<div class="overlay" id="otaOverlay"><div class="modal"><p id="otaMsg">Abriendo p&aacute;gina OTA...</p><div class="modal-btns"><button id="otaGoBtn" style="background:#1d4ed8;color:#fff" onclick="window.location='/update';hideOTA()">Ir a OTA</button><button id="otaCancelBtn" style="background:#374151;color:#e2e8f0" onclick="hideOTA()">Cancelar</button></div></div></div>
+<div class="overlay" id="peakOverlay"><div class="modal"><p id="peakMsg">&iquest;Borrar T. m&aacute;x registradas?</p><div class="modal-btns"><button id="peakYesBtn" style="background:#16a34a;color:#fff" onclick="doResetPeak()">S&iacute;</button><button id="peakNoBtn" style="background:#374151;color:#e2e8f0" onclick="hidePeakRst()">No</button></div></div></div>
+<div class="overlay" id="rstOverlay"><div class="modal"><p id="rstMsg">&iquest;Reiniciar el ESP ahora?</p><div class="modal-btns"><button id="rstYesBtn" style="background:#dc2626;color:#fff" onclick="doRestart()">S&iacute;</button><button id="rstNoBtn" style="background:#374151;color:#e2e8f0" onclick="hideRst()">No</button></div></div></div>
 <footer id="footer">ESP32-C3 · Snapmaker U1 Fan Control 24V · v0.0.0 · Auto-refresh 3 s</footer>
 <div class="creator"><a href="#" onclick="return false;">Creado por <strong>Regata</strong></a></div>
 <div class="social-links"><a href="https://t.me/regata3dprint" target="_blank" rel="noopener noreferrer">📨 Telegram @regata3dprint</a><a href="https://instagram.com/regata3dprint" target="_blank" rel="noopener noreferrer">📷 Instagram @regata3dprint</a></div>
 <script>
-const TR={es:{z1title:'&#9881; Drivers de Motores',z2title:'&#9889; Fuente de Alimentaci\u00f3n',lblAllZones:'Todas las zonas:',lblTemp:'Temperatura',lblMode:'Modo',lblAuto:'Control autom\u00e1tico',lblTHigh:'Umbral ON (\u00b0C)',lblHyst:'Hist\u00e9resis (\u00b0C)',lblPeakT:'T. m\u00e1x',lblManual:'Control manual',btnSaveZ:'Guardar Zona ',btnOTA:'OTA',btnWifi:'WiFi',btnRestart:'Reiniciar ESP',btnUpdates:'Buscar actualizaciones',btnAllAuto:'AUTO',btnAllMan:'MANUAL',btnOn:'Encender',btnOff:'Apagar',modeAuto:'AUTO',modeManual:'MANUAL',fanOn:'ENCENDIDO',fanOff:'APAGADO',otaMsg:'Abriendo p\u00e1gina OTA...',rstMsg:'\u00bfReiniciar el ESP ahora?',peakMsg:'\u00bfBorrar T. m\u00e1x registradas?',btnResetPeak:'T.max',sensNone:'Sin sensor',sens1:'Sensor',sensZ1:'Zona 1',sensZ2:'Zona 2',sensShared:'Zonas 1+2',sensAlertNone:'No se detecta ning\u00fan DS18B20. Revisa GPIO4, 3.3V, GND y la resistencia pull-up de 4.7k.',sensAlertMissing:'Hay sensores DS18B20 sin lectura v\u00e1lida. Revisa cableado, conexiones o el propio sensor.',sensAlertZ1:'La zona 1 no tiene lectura v\u00e1lida.',sensAlertZ2:'La zona 2 no tiene lectura v\u00e1lida.',xlbl:'-3min',xnow:'ahora',footer:'ESP32-C3 · Snapmaker U1 Fan Control 24V · {version} · Auto-refresh 3 s',upToDate:'Ya est\u00e1s en la \u00faltima versi\u00f3n',updateAvail:'Hay una nueva versi\u00f3n disponible: {latest}. Tu firmware actual es {current}. \u00bfQuieres abrir la descarga?',updateOpenRelease:'No se encontr\u00f3 un .bin en la release. Se abrir\u00e1 la p\u00e1gina de GitHub.',updateError:'No se pudo comprobar GitHub ahora mismo.'},en:{z1title:'&#9881; Motor Drivers',z2title:'&#9889; Power Supply',lblAllZones:'All zones:',lblTemp:'Temperature',lblMode:'Mode',lblAuto:'Automatic control',lblTHigh:'ON threshold (\u00b0C)',lblHyst:'Hysteresis (\u00b0C)',lblPeakT:'Peak T',lblManual:'Manual control',btnSaveZ:'Save Zone ',btnOTA:'OTA',btnWifi:'WiFi',btnRestart:'Restart ESP',btnUpdates:'Check updates',btnAllAuto:'AUTO',btnAllMan:'MANUAL',btnOn:'Turn on',btnOff:'Turn off',modeAuto:'AUTO',modeManual:'MANUAL',fanOn:'ON',fanOff:'OFF',otaMsg:'Opening OTA page...',rstMsg:'Restart the ESP now?',peakMsg:'Clear recorded peak temperatures?',btnResetPeak:'Peak T',sensNone:'No sensor',sens1:'Sensor',sensZ1:'Zone 1',sensZ2:'Zone 2',sensShared:'Zones 1+2',sensAlertNone:'No DS18B20 detected. Check GPIO4, 3.3V, GND, and the 4.7k pull-up resistor.',sensAlertMissing:'There are DS18B20 sensors without a valid reading. Check wiring, connections, or the sensor itself.',sensAlertZ1:'Zone 1 has no valid reading.',sensAlertZ2:'Zone 2 has no valid reading.',xlbl:'-3min',xnow:'now',footer:'ESP32-C3 · Snapmaker U1 Fan Control 24V · {version} · Auto-refresh 3 s',upToDate:'You already have the latest version',updateAvail:'A new version is available: {latest}. Your current firmware is {current}. Open the download?',updateOpenRelease:'No .bin asset was found in the release. Opening GitHub release page.',updateError:'GitHub could not be checked right now.'}};
-let LG=localStorage.getItem('lang')||'es';
+const TR={es:{z1title:'&#9881; Drivers de Motores',z2title:'&#9889; Fuente de Alimentaci\u00f3n',lblAllZones:'Todas las zonas:',lblTemp:'Temperatura',lblMode:'Modo',lblAuto:'Control autom\u00e1tico',lblTHigh:'Umbral ON (\u00b0C)',lblHyst:'Hist\u00e9resis (\u00b0C)',lblPeakT:'T. m\u00e1x',lblManual:'Control manual',btnSaveZ:'Guardar Zona ',btnOTA:'OTA',btnWifi:'WiFi',btnRestart:'Reiniciar ESP',btnUpdates:'Buscar actualizaciones',btnAllAuto:'AUTO',btnAllMan:'MANUAL',btnOn:'Encender',btnOff:'Apagar',modeAuto:'AUTO',modeManual:'MANUAL',fanOn:'ENCENDIDO',fanOff:'APAGADO',otaMsg:'Abriendo p\u00e1gina OTA...',rstMsg:'\u00bfReiniciar el ESP ahora?',peakMsg:'\u00bfBorrar T. m\u00e1x registradas?',btnResetPeak:'T.max',sensNone:'Sin sensor',sens1:'Sensor',sensZ1:'Zona 1',sensZ2:'Zona 2',sensShared:'Zonas 1+2',sensAlertNone:'No se detecta ning\u00fan DS18B20. Revisa GPIO4, 3.3V, GND y la resistencia pull-up de 4.7k.',sensAlertMissing:'Hay sensores DS18B20 sin lectura v\u00e1lida. Revisa cableado, conexiones o el propio sensor.',sensAlertZ1:'La zona 1 no tiene lectura v\u00e1lida.',sensAlertZ2:'La zona 2 no tiene lectura v\u00e1lida.',xlbl:'-3min',xnow:'ahora',footer:'ESP32-C3 · Snapmaker U1 Fan Control 24V · {version} · Auto-refresh 3 s',upToDate:'Ya est\u00e1s en la \u00faltima versi\u00f3n',updateAvail:'Hay una nueva versi\u00f3n disponible: {latest}. Tu firmware actual es {current}. \u00bfQuieres abrir la descarga?',updateOpenRelease:'No se encontr\u00f3 un .bin en la release. Se abrir\u00e1 la p\u00e1gina de GitHub.',updateError:'No se pudo comprobar GitHub ahora mismo.',saveError:'Error al guardar'},en:{z1title:'&#9881; Motor Drivers',z2title:'&#9889; Power Supply',lblAllZones:'All zones:',lblTemp:'Temperature',lblMode:'Mode',lblAuto:'Automatic control',lblTHigh:'ON threshold (\u00b0C)',lblHyst:'Hysteresis (\u00b0C)',lblPeakT:'Peak T',lblManual:'Manual control',btnSaveZ:'Save Zone ',btnOTA:'OTA',btnWifi:'WiFi',btnRestart:'Restart ESP',btnUpdates:'Check updates',btnAllAuto:'AUTO',btnAllMan:'MANUAL',btnOn:'Turn on',btnOff:'Turn off',modeAuto:'AUTO',modeManual:'MANUAL',fanOn:'ON',fanOff:'OFF',otaMsg:'Opening OTA page...',rstMsg:'Restart the ESP now?',peakMsg:'Clear recorded peak temperatures?',btnResetPeak:'Peak T',sensNone:'No sensor',sens1:'Sensor',sensZ1:'Zone 1',sensZ2:'Zone 2',sensShared:'Zones 1+2',sensAlertNone:'No DS18B20 detected. Check GPIO4, 3.3V, GND, and the 4.7k pull-up resistor.',sensAlertMissing:'There are DS18B20 sensors without a valid reading. Check wiring, connections, or the sensor itself.',sensAlertZ1:'Zone 1 has no valid reading.',sensAlertZ2:'Zone 2 has no valid reading.',xlbl:'-3min',xnow:'now',footer:'ESP32-C3 · Snapmaker U1 Fan Control 24V · {version} · Auto-refresh 3 s',upToDate:'You already have the latest version',updateAvail:'A new version is available: {latest}. Your current firmware is {current}. Open the download?',updateOpenRelease:'No .bin asset was found in the release. Opening GitHub release page.',updateError:'GitHub could not be checked right now.',saveError:'Save error'},fr:{z1title:'&#9881; Pilotes moteurs',z2title:'&#9889; Alimentation',lblAllZones:'Toutes les zones :',lblTemp:'Température',lblMode:'Mode',lblAuto:'Contrôle automatique',lblTHigh:'Seuil ON (\u00b0C)',lblHyst:'Hystérésis (\u00b0C)',lblPeakT:'T max',lblManual:'Contrôle manuel',btnSaveZ:'Enregistrer zone ',btnOTA:'OTA',btnWifi:'WiFi',btnRestart:'Redémarrer ESP',btnUpdates:'Rechercher des mises à jour',btnAllAuto:'AUTO',btnAllMan:'MANUEL',btnOn:'Allumer',btnOff:'Éteindre',modeAuto:'AUTO',modeManual:'MANUEL',fanOn:'ALLUMÉ',fanOff:'ÉTEINT',otaMsg:'Ouverture de la page OTA...',rstMsg:'Redémarrer l\'ESP maintenant ?',peakMsg:'Effacer les températures maximales enregistrées ?',btnResetPeak:'T.max',sensNone:'Aucun capteur',sens1:'Capteur',sensZ1:'Zone 1',sensZ2:'Zone 2',sensShared:'Zones 1+2',sensAlertNone:'Aucun DS18B20 détecté. Vérifiez GPIO4, 3.3V, GND et la résistance pull-up de 4.7k.',sensAlertMissing:'Des capteurs DS18B20 n\'ont pas de lecture valide. Vérifiez le câblage, les connexions ou le capteur.',sensAlertZ1:'La zone 1 n\'a pas de lecture valide.',sensAlertZ2:'La zone 2 n\'a pas de lecture valide.',xlbl:'-3min',xnow:'maintenant',footer:'ESP32-C3 · Snapmaker U1 Fan Control 24V · {version} · Actualisation auto 3 s',upToDate:'Vous avez déjà la dernière version',updateAvail:'Une nouvelle version est disponible : {latest}. Votre firmware actuel est {current}. Ouvrir le téléchargement ?',updateOpenRelease:'Aucun fichier .bin trouvé dans la release. Ouverture de la page GitHub.',updateError:'Impossible de vérifier GitHub pour le moment.',saveError:'Erreur lors de l\'enregistrement'},it:{z1title:'&#9881; Driver motori',z2title:'&#9889; Alimentazione',lblAllZones:'Tutte le zone:',lblTemp:'Temperatura',lblMode:'Modalità',lblAuto:'Controllo automatico',lblTHigh:'Soglia ON (\u00b0C)',lblHyst:'Isteresi (\u00b0C)',lblPeakT:'T max',lblManual:'Controllo manuale',btnSaveZ:'Salva zona ',btnOTA:'OTA',btnWifi:'WiFi',btnRestart:'Riavvia ESP',btnUpdates:'Cerca aggiornamenti',btnAllAuto:'AUTO',btnAllMan:'MANUALE',btnOn:'Accendi',btnOff:'Spegni',modeAuto:'AUTO',modeManual:'MANUALE',fanOn:'ACCESO',fanOff:'SPENTO',otaMsg:'Apertura pagina OTA...',rstMsg:'Riavviare ora l\'ESP?',peakMsg:'Cancellare le temperature massime registrate?',btnResetPeak:'T.max',sensNone:'Nessun sensore',sens1:'Sensore',sensZ1:'Zona 1',sensZ2:'Zona 2',sensShared:'Zone 1+2',sensAlertNone:'Nessun DS18B20 rilevato. Controlla GPIO4, 3.3V, GND e la resistenza pull-up da 4.7k.',sensAlertMissing:'Ci sono sensori DS18B20 senza una lettura valida. Controlla cablaggio, connessioni o il sensore.',sensAlertZ1:'La zona 1 non ha una lettura valida.',sensAlertZ2:'La zona 2 non ha una lettura valida.',xlbl:'-3min',xnow:'ora',footer:'ESP32-C3 · Snapmaker U1 Fan Control 24V · {version} · Aggiornamento auto 3 s',upToDate:'Hai già l\'ultima versione',updateAvail:'È disponibile una nuova versione: {latest}. Il firmware attuale è {current}. Aprire il download?',updateOpenRelease:'Nessun file .bin trovato nella release. Apertura pagina GitHub.',updateError:'Impossibile controllare GitHub in questo momento.',saveError:'Errore di salvataggio'},pt:{z1title:'&#9881; Drivers dos motores',z2title:'&#9889; Fonte de alimentação',lblAllZones:'Todas as zonas:',lblTemp:'Temperatura',lblMode:'Modo',lblAuto:'Controlo automático',lblTHigh:'Limite ON (\u00b0C)',lblHyst:'Histerese (\u00b0C)',lblPeakT:'T máx',lblManual:'Controlo manual',btnSaveZ:'Guardar zona ',btnOTA:'OTA',btnWifi:'WiFi',btnRestart:'Reiniciar ESP',btnUpdates:'Procurar atualizações',btnAllAuto:'AUTO',btnAllMan:'MANUAL',btnOn:'Ligar',btnOff:'Desligar',modeAuto:'AUTO',modeManual:'MANUAL',fanOn:'LIGADO',fanOff:'DESLIGADO',otaMsg:'A abrir página OTA...',rstMsg:'Reiniciar o ESP agora?',peakMsg:'Apagar temperaturas máximas registadas?',btnResetPeak:'T.max',sensNone:'Sem sensor',sens1:'Sensor',sensZ1:'Zona 1',sensZ2:'Zona 2',sensShared:'Zonas 1+2',sensAlertNone:'Nenhum DS18B20 detetado. Verifique GPIO4, 3.3V, GND e a resistência pull-up de 4.7k.',sensAlertMissing:'Existem sensores DS18B20 sem leitura válida. Verifique a cablagem, ligações ou o próprio sensor.',sensAlertZ1:'A zona 1 não tem leitura válida.',sensAlertZ2:'A zona 2 não tem leitura válida.',xlbl:'-3min',xnow:'agora',footer:'ESP32-C3 · Snapmaker U1 Fan Control 24V · {version} · Atualização auto 3 s',upToDate:'Já tem a versão mais recente',updateAvail:'Há uma nova versão disponível: {latest}. O firmware atual é {current}. Abrir a transferência?',updateOpenRelease:'Não foi encontrado nenhum .bin na release. A abrir página do GitHub.',updateError:'Não foi possível verificar o GitHub agora.',saveError:'Erro ao guardar'},de:{z1title:'&#9881; Motortreiber',z2title:'&#9889; Netzteil',lblAllZones:'Alle Zonen:',lblTemp:'Temperatur',lblMode:'Modus',lblAuto:'Automatische Steuerung',lblTHigh:'ON-Schwelle (\u00b0C)',lblHyst:'Hysterese (\u00b0C)',lblPeakT:'Max. T',lblManual:'Manuelle Steuerung',btnSaveZ:'Zone speichern ',btnOTA:'OTA',btnWifi:'WiFi',btnRestart:'ESP neu starten',btnUpdates:'Nach Updates suchen',btnAllAuto:'AUTO',btnAllMan:'MANUELL',btnOn:'Einschalten',btnOff:'Ausschalten',modeAuto:'AUTO',modeManual:'MANUELL',fanOn:'EIN',fanOff:'AUS',otaMsg:'OTA-Seite wird geöffnet...',rstMsg:'ESP jetzt neu starten?',peakMsg:'Gespeicherte Maximaltemperaturen löschen?',btnResetPeak:'T.max',sensNone:'Kein Sensor',sens1:'Sensor',sensZ1:'Zone 1',sensZ2:'Zone 2',sensShared:'Zonen 1+2',sensAlertNone:'Kein DS18B20 erkannt. Prüfen Sie GPIO4, 3.3V, GND und den 4.7k-Pull-up-Widerstand.',sensAlertMissing:'Es gibt DS18B20-Sensoren ohne gültigen Messwert. Prüfen Sie Verkabelung, Verbindungen oder den Sensor.',sensAlertZ1:'Zone 1 hat keinen gültigen Messwert.',sensAlertZ2:'Zone 2 hat keinen gültigen Messwert.',xlbl:'-3min',xnow:'jetzt',footer:'ESP32-C3 · Snapmaker U1 Fan Control 24V · {version} · Auto-Refresh 3 s',upToDate:'Sie haben bereits die neueste Version',updateAvail:'Eine neue Version ist verfügbar: {latest}. Ihre aktuelle Firmware ist {current}. Download öffnen?',updateOpenRelease:'Kein .bin-Asset in der Release gefunden. GitHub-Release-Seite wird geöffnet.',updateError:'GitHub konnte gerade nicht geprüft werden.',saveError:'Fehler beim Speichern'},zh:{z1title:'&#9881; 电机驱动',z2title:'&#9889; 电源',lblAllZones:'所有区域：',lblTemp:'温度',lblMode:'模式',lblAuto:'自动控制',lblTHigh:'开启阈值 (\u00b0C)',lblHyst:'迟滞 (\u00b0C)',lblPeakT:'最高温',lblManual:'手动控制',btnSaveZ:'保存区域 ',btnOTA:'OTA',btnWifi:'WiFi',btnRestart:'重启 ESP',btnUpdates:'检查更新',btnAllAuto:'AUTO',btnAllMan:'手动',btnOn:'开启',btnOff:'关闭',modeAuto:'AUTO',modeManual:'手动',fanOn:'开启',fanOff:'关闭',otaMsg:'正在打开 OTA 页面...',rstMsg:'现在重启 ESP 吗？',peakMsg:'清除已记录的最高温度吗？',btnResetPeak:'T.max',sensNone:'无传感器',sens1:'传感器',sensZ1:'区域 1',sensZ2:'区域 2',sensShared:'区域 1+2',sensAlertNone:'未检测到 DS18B20。请检查 GPIO4、3.3V、GND 和 4.7k 上拉电阻。',sensAlertMissing:'有 DS18B20 传感器没有有效读数。请检查接线、连接或传感器本体。',sensAlertZ1:'区域 1 没有有效读数。',sensAlertZ2:'区域 2 没有有效读数。',xlbl:'-3分钟',xnow:'现在',footer:'ESP32-C3 · Snapmaker U1 Fan Control 24V · {version} · 自动刷新 3 秒',upToDate:'已经是最新版本',updateAvail:'发现新版本：{latest}。当前固件为 {current}。要打开下载页面吗？',updateOpenRelease:'该 release 中未找到 .bin 文件，将打开 GitHub 页面。',updateError:'当前无法检查 GitHub。',saveError:'保存错误'}};
+const LOCALE_MAP={es:'es-ES',en:'en-GB',fr:'fr-FR',it:'it-IT',pt:'pt-PT',de:'de-DE',zh:'zh-CN'};
+let LG=TR[localStorage.getItem('lang')]?localStorage.getItem('lang'):'es';
 let FW_VER='v0.0.0';
 let FW_REPO='MrRegata/SnapFan';
 let updatePrompted=false;
 let updateDismissedVersion=localStorage.getItem('updateDismissedVersion')||'';
-function netText(key){const isEs=LG==='es';return{ssid:'SSID',ip:'IP',signal:isEs?'Señal':'Signal',time:isEs?'Hora':'Time',noWifi:isEs?'Sin WiFi':'No WiFi',noTime:isEs?'Sin hora':'No time',noSignal:isEs?'Sin señal':'No signal'}[key];}
+async function persistLang(lang){try{await fetch('/setlang?lang='+encodeURIComponent(lang));}catch(e){}}
+function netText(key){return{ssid:'SSID',ip:'IP',signal:TR[LG].signal||'Signal',time:TR[LG].clock||'Time',noWifi:TR[LG].noWifi||'No WiFi',noTime:TR[LG].noTime||'No time',noSignal:(LG==='es'?'Sin señal':LG==='fr'?'Pas de signal':LG==='it'?'Nessun segnale':LG==='pt'?'Sem sinal':LG==='de'?'Kein Signal':'无信号')}[key];}
 function fmt(tpl,vars){return tpl.replace(/\{(\w+)\}/g,(_,k)=>vars[k]??'');}
 function normVer(v){return String(v||'').trim().replace(/^v/i,'');}
 function cmpVer(a,b){const pa=normVer(a).split('.').map(v=>parseInt(v,10)||0);const pb=normVer(b).split('.').map(v=>parseInt(v,10)||0);const len=Math.max(pa.length,pb.length);for(let i=0;i<len;i++){const av=pa[i]||0,bv=pb[i]||0;if(av>bv)return 1;if(av<bv)return -1;}return 0;}
-function setLang(l){LG=l;localStorage.setItem('lang',l);const t=TR[l];document.getElementById('langSel').value=l;document.getElementById('z1title').innerHTML=t.z1title;document.getElementById('z2title').innerHTML=t.z2title;document.getElementById('lblAllZones').textContent=t.lblAllZones;document.getElementById('btnAllAuto').textContent=t.btnAllAuto;document.getElementById('btnAllMan').textContent=t.btnAllMan;document.getElementById('btnUpdates').innerHTML='<span class="btn-ico">⬇️</span><span>'+t.btnUpdates+'</span>';document.getElementById('btnOTA').innerHTML='<span class="btn-ico">📦</span><span>'+t.btnOTA+'</span>';document.getElementById('btnWifi').innerHTML='<span class="btn-ico">📶</span><span>'+t.btnWifi+'</span>';document.getElementById('btnRestart').innerHTML='<span class="btn-ico">🔄</span><span>'+t.btnRestart+'</span>';document.getElementById('btnResetPeak').innerHTML='<span class="btn-ico">🌡️</span><span>'+t.btnResetPeak+'</span>';document.getElementById('lblNetSsid').textContent=netText('ssid');document.getElementById('lblNetIp').textContent=netText('ip');document.getElementById('lblNetSignal').textContent=netText('signal');document.getElementById('lblNetTime').textContent=netText('time');for(const z of['1','2']){document.getElementById('lblTemp'+z).textContent=t.lblTemp;document.getElementById('lblMode'+z).textContent=t.lblMode;document.getElementById('lblAuto'+z).textContent=t.lblAuto;document.getElementById('lblTHigh'+z).textContent=t.lblTHigh;document.getElementById('lblHyst'+z).textContent=t.lblHyst;document.getElementById('lblPeakT'+z).textContent=t.lblPeakT;document.getElementById('lblManual'+z).textContent=t.lblManual;document.getElementById('btnSaveZ'+z).textContent=t.btnSaveZ+z;document.getElementById('z'+z+'on').textContent=t.btnOn;document.getElementById('z'+z+'off').textContent=t.btnOff;document.getElementById('xlbl'+z).textContent=t.xlbl;document.getElementById('xnow'+z).textContent=t.xnow;}document.getElementById('otaMsg').textContent=t.otaMsg;document.getElementById('rstMsg').textContent=t.rstMsg;document.getElementById('peakMsg').textContent=t.peakMsg;document.getElementById('footer').textContent=fmt(t.footer,{version:FW_VER});document.getElementById('fwVersion').textContent=FW_VER;}
-function formatNetDatePart(epoch, kind){if(!epoch)return netText('noTime');const loc=LG==='es'?'es-ES':'en-GB';const d=new Date(epoch*1000);if(kind==='day'){const text=d.toLocaleDateString(loc,{weekday:'long'});return text.charAt(0).toUpperCase()+text.slice(1);}if(kind==='date'){return d.toLocaleDateString(loc,{day:'2-digit',month:'2-digit',year:'numeric'});}return d.toLocaleTimeString(loc,{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+function extraText(key){const map={otaGo:{es:'Ir a OTA',en:'Go to OTA',fr:'Aller vers OTA',it:'Vai a OTA',pt:'Ir para OTA',de:'Zu OTA',zh:'前往 OTA'},cancel:{es:'Cancelar',en:'Cancel',fr:'Annuler',it:'Annulla',pt:'Cancelar',de:'Abbrechen',zh:'取消'},yes:{es:'Sí',en:'Yes',fr:'Oui',it:'Sì',pt:'Sim',de:'Ja',zh:'是'},no:{es:'No',en:'No',fr:'Non',it:'No',pt:'Não',de:'Nein',zh:'否'}};return (map[key]&&map[key][LG])||map[key].es;}
+function setLang(l,persist=true){LG=TR[l]?l:'es';localStorage.setItem('lang',LG);const t=TR[LG];document.documentElement.lang=LG;document.getElementById('langSel').value=LG;document.getElementById('z1title').innerHTML=t.z1title;document.getElementById('z2title').innerHTML=t.z2title;document.getElementById('lblAllZones').textContent=t.lblAllZones;document.getElementById('btnAllAuto').textContent=t.btnAllAuto;document.getElementById('btnAllMan').textContent=t.btnAllMan;document.getElementById('btnUpdates').innerHTML='<span class="btn-ico">⬇️</span><span>'+t.btnUpdates+'</span>';document.getElementById('btnOTA').innerHTML='<span class="btn-ico">📦</span><span>'+t.btnOTA+'</span>';document.getElementById('btnWifi').innerHTML='<span class="btn-ico">📶</span><span>'+t.btnWifi+'</span>';document.getElementById('btnRestart').innerHTML='<span class="btn-ico">🔄</span><span>'+t.btnRestart+'</span>';document.getElementById('btnResetPeak').innerHTML='<span class="btn-ico">🌡️</span><span>'+t.btnResetPeak+'</span>';document.getElementById('lblNetSsid').textContent=netText('ssid');document.getElementById('lblNetIp').textContent=netText('ip');document.getElementById('lblNetSignal').textContent=netText('signal');document.getElementById('lblNetTime').textContent=netText('time');for(const z of['1','2']){document.getElementById('lblTemp'+z).textContent=t.lblTemp;document.getElementById('lblMode'+z).textContent=t.lblMode;document.getElementById('lblAuto'+z).textContent=t.lblAuto;document.getElementById('lblTHigh'+z).textContent=t.lblTHigh;document.getElementById('lblHyst'+z).textContent=t.lblHyst;document.getElementById('lblPeakT'+z).textContent=t.lblPeakT;document.getElementById('lblManual'+z).textContent=t.lblManual;document.getElementById('btnSaveZ'+z).textContent=t.btnSaveZ+z;document.getElementById('z'+z+'on').textContent=t.btnOn;document.getElementById('z'+z+'off').textContent=t.btnOff;document.getElementById('xlbl'+z).textContent=t.xlbl;document.getElementById('xnow'+z).textContent=t.xnow;}document.getElementById('otaMsg').textContent=t.otaMsg;document.getElementById('rstMsg').textContent=t.rstMsg;document.getElementById('peakMsg').textContent=t.peakMsg;document.getElementById('otaGoBtn').textContent=extraText('otaGo');document.getElementById('otaCancelBtn').textContent=extraText('cancel');document.getElementById('peakYesBtn').textContent=extraText('yes');document.getElementById('peakNoBtn').textContent=extraText('no');document.getElementById('rstYesBtn').textContent=extraText('yes');document.getElementById('rstNoBtn').textContent=extraText('no');document.getElementById('footer').textContent=fmt(t.footer,{version:FW_VER});document.getElementById('fwVersion').textContent=FW_VER;if(persist)persistLang(LG);}
+function formatNetDatePart(epoch, kind){if(!epoch)return netText('noTime');const loc=LOCALE_MAP[LG]||'es-ES';const d=new Date(epoch*1000);if(kind==='day'){const text=d.toLocaleDateString(loc,{weekday:'long'});return text.charAt(0).toUpperCase()+text.slice(1);}if(kind==='date'){return d.toLocaleDateString(loc,{day:'2-digit',month:'2-digit',year:'numeric'});}return d.toLocaleTimeString(loc,{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
 function formatSignal(rssi){if(typeof rssi!=='number'||rssi<=-126)return netText('noSignal');const quality=Math.max(0,Math.min(100,Math.round(2*(rssi+100))));return rssi+' dBm · '+quality+'%';}
 function setSensorAlert(d){const el=document.getElementById('sensorAlert');if(!el)return;const t=TR[LG];const sc=parseInt(d.sc)||0;const s1ok=!!d.s1ok;const s2ok=!!d.s2ok;let msg='';if(sc===0){msg=t.sensAlertNone;}else if(!s1ok||!s2ok){const missing=[];if(!s1ok)missing.push(t.sensAlertZ1);if(!s2ok)missing.push(t.sensAlertZ2);msg=t.sensAlertMissing+' '+missing.join(' ');}el.innerHTML=msg?'<strong>DS18B20:</strong> '+msg:'';el.classList.toggle('show',!!msg);}
 function showOTA(){document.getElementById('otaOverlay').classList.add('show');}function hideOTA(){document.getElementById('otaOverlay').classList.remove('show');}function confirmRestart(){document.getElementById('rstOverlay').classList.add('show');}function hideRst(){document.getElementById('rstOverlay').classList.remove('show');}function confirmResetPeak(){document.getElementById('peakOverlay').classList.add('show');}function hidePeakRst(){document.getElementById('peakOverlay').classList.remove('show');}
@@ -651,8 +714,8 @@ function setZoneUI(z,autoMode,manualOn){const b=document.getElementById('zmdg'+z
 async function toggleZoneMode(z){const cur=document.getElementById('zmdg'+z).textContent===TR[LG].modeAuto;await fetch('/setmode?zone='+z+'&mode='+(cur?'manual':'auto'));refresh();}
 async function setAllMode(m){await fetch('/setmode?mode='+m);refresh();}
 async function setManual(z,on){await fetch('/setmanual?zone='+z+'&on='+on);refresh();}
-async function refresh(){try{const d=await(await fetch('/status')).json();if(d.ver){FW_VER='v'+normVer(d.ver);if(updateDismissedVersion&&cmpVer(updateDismissedVersion,FW_VER)<=0){updateDismissedVersion='';localStorage.removeItem('updateDismissedVersion');}}if(d.repo){FW_REPO=d.repo;}document.getElementById('netSsid').textContent=d.ssid||netText('noWifi');document.getElementById('netIp').textContent=d.ip||'--';document.getElementById('netSignal').textContent=formatSignal(Number(d.rssi));document.getElementById('netTime').textContent=formatNetDatePart(parseInt(d.epoch)||0,'time');setSensorAlert(d);for(const z of['1','2']){const ok=!!d['s'+z+'ok'];const te=document.getElementById('t'+z);if(ok){const tv=parseFloat(d['t'+z]).toFixed(1);te.textContent=tv+'\u00b0C';te.className='sv '+tc(parseFloat(tv));}else{te.textContent='--.-\u00b0C';te.className='sv state';}setFanState(z,d['on'+z]);}sf('z1th',d.z1th);sf('z1hy',d.z1hy);sf('z2th',d.z2th);sf('z2hy',d.z2hy);setZoneUI('1',d.z1auto,d.z1man);setZoneUI('2',d.z2auto,d.z2man);const sc=parseInt(d.sc)||0;const t=TR[LG];document.getElementById('fwVersion').textContent=FW_VER;document.getElementById('footer').textContent=fmt(t.footer,{version:FW_VER});for(let z=1;z<=2;z++){const el=document.getElementById('sensInfo'+z);if(!el)continue;if(sc===0){el.textContent='🌡️ '+t.sensNone;}else if(sc===1){el.innerHTML='🌡️ '+t.sens1+' &bull; '+(z===1?t.sensZ1:t.sensShared);}else{el.innerHTML='🌡️ '+t.sens1+(z===2?' #2':' #1')+' &bull; '+(z===1?t.sensZ1:t.sensZ2);}}for(const z of['1','2']){const pk=parseFloat(d['mx'+z]);if(!isNaN(pk)&&pk>-100){if(maxTemp[z]===null||pk>maxTemp[z])maxTemp[z]=pk;const el=document.getElementById('mx'+z);if(el)el.textContent=maxTemp[z].toFixed(1)+'\u00b0C';}}if(!updatePrompted&&FW_REPO){updatePrompted=true;setTimeout(()=>checkForUpdates(false),1200);}}catch(e){}}
-async function saveZone(e,z){e.preventDefault();const p=new URLSearchParams({zone:z,thigh:document.getElementById('z'+z+'th').value,hyst:document.getElementById('z'+z+'hy').value});const r=await fetch('/set?'+p);if(!r.ok){alert('Error');}else{delete D['z'+z+'th'];delete D['z'+z+'hy'];refresh();}}
+async function refresh(){try{const d=await(await fetch('/status')).json();if(d.lang&&TR[d.lang]&&d.lang!==LG){setLang(d.lang,false);}if(d.ver){FW_VER='v'+normVer(d.ver);if(updateDismissedVersion&&cmpVer(updateDismissedVersion,FW_VER)<=0){updateDismissedVersion='';localStorage.removeItem('updateDismissedVersion');}}if(d.repo){FW_REPO=d.repo;}document.getElementById('netSsid').textContent=d.ssid||netText('noWifi');document.getElementById('netIp').textContent=d.ip||'--';document.getElementById('netSignal').textContent=formatSignal(Number(d.rssi));document.getElementById('netTime').textContent=formatNetDatePart(parseInt(d.epoch)||0,'time');setSensorAlert(d);for(const z of['1','2']){const ok=!!d['s'+z+'ok'];const te=document.getElementById('t'+z);if(ok){const tv=parseFloat(d['t'+z]).toFixed(1);te.textContent=tv+'\u00b0C';te.className='sv '+tc(parseFloat(tv));}else{te.textContent='--.-\u00b0C';te.className='sv state';}setFanState(z,d['on'+z]);}sf('z1th',d.z1th);sf('z1hy',d.z1hy);sf('z2th',d.z2th);sf('z2hy',d.z2hy);setZoneUI('1',d.z1auto,d.z1man);setZoneUI('2',d.z2auto,d.z2man);const sc=parseInt(d.sc)||0;const t=TR[LG];document.getElementById('fwVersion').textContent=FW_VER;document.getElementById('footer').textContent=fmt(t.footer,{version:FW_VER});for(let z=1;z<=2;z++){const el=document.getElementById('sensInfo'+z);if(!el)continue;if(sc===0){el.textContent='🌡️ '+t.sensNone;}else if(sc===1){el.innerHTML='🌡️ '+t.sens1+' &bull; '+(z===1?t.sensZ1:t.sensShared);}else{el.innerHTML='🌡️ '+t.sens1+(z===2?' #2':' #1')+' &bull; '+(z===1?t.sensZ1:t.sensZ2);}}for(const z of['1','2']){const pk=parseFloat(d['mx'+z]);if(!isNaN(pk)&&pk>-100){if(maxTemp[z]===null||pk>maxTemp[z])maxTemp[z]=pk;const el=document.getElementById('mx'+z);if(el)el.textContent=maxTemp[z].toFixed(1)+'\u00b0C';}}if(!updatePrompted&&FW_REPO){updatePrompted=true;setTimeout(()=>checkForUpdates(false),1200);}}catch(e){}}
+async function saveZone(e,z){e.preventDefault();const p=new URLSearchParams({zone:z,thigh:document.getElementById('z'+z+'th').value,hyst:document.getElementById('z'+z+'hy').value});const r=await fetch('/set?'+p);if(!r.ok){alert(TR[LG].saveError||'Error');}else{delete D['z'+z+'th'];delete D['z'+z+'hy'];refresh();}}
 window.addEventListener('load',()=>{setLang(LG);fetchHistory();refresh();setInterval(refresh,3000);setInterval(fetchHistory,15000);});
 </script></body></html>
 )rawliteral";
@@ -719,6 +782,18 @@ void handleSetMode() {
     const int zone = server.hasArg("zone") ? server.arg("zone").toInt() : 0;
     if (zone == 1) z1Auto = a; else if (zone == 2) z2Auto = a; else z1Auto = z2Auto = a;
     saveSettings();
+    server.send(200, "text/plain", "OK");
+}
+
+void handleSetLang() {
+    if (!server.hasArg("lang")) {
+      server.send(400, "text/plain", "Falta lang"); return;
+    }
+    const String lang = server.arg("lang");
+    if (lang.length() != 2 || !isSupportedLanguageCode(lang.c_str())) {
+      server.send(400, "text/plain", "Idioma invalido"); return;
+    }
+    saveLanguagePref(lang.c_str());
     server.send(200, "text/plain", "OK");
 }
 
@@ -791,6 +866,7 @@ void setup() {
 
     // EEPROM
     EEPROM.begin(EEPROM_SIZE);
+    loadLanguagePref();
     loadSettings();
     loadPeakTemps();
     Serial.printf("Z1: %s  Z2: %s\n", z1Auto ? "AUTO" : "MANUAL", z2Auto ? "AUTO" : "MANUAL");
@@ -822,6 +898,7 @@ void setup() {
       server.on("/wifi", HTTP_GET, handleWifiPage);
       server.on("/wifi/scan", HTTP_GET, handleWifiScan);
       server.on("/status", HTTP_GET, handleStatus);
+      server.on("/setlang", HTTP_GET, handleSetLang);
       server.on("/savewifi", HTTP_POST, handleSaveWifi);
       server.onNotFound([]() {
         server.sendHeader("Location", "http://192.168.4.1/", true);
@@ -849,6 +926,7 @@ void setup() {
       server.on("/wifi",     HTTP_GET, handleWifiPage);
       server.on("/wifi/scan", HTTP_GET, handleWifiScan);
       server.on("/status",   HTTP_GET, handleStatus);
+      server.on("/setlang",  HTTP_GET, handleSetLang);
       server.on("/history",  HTTP_GET, handleHistory);
       server.on("/set",      HTTP_GET, handleSet);
       server.on("/setmode",  HTTP_GET, handleSetMode);
@@ -878,12 +956,20 @@ void setup() {
 
     sensors.requestTemperatures();
     const float r1 = twoSensors ? sensors.getTempC(addr1) : sensors.getTempCByIndex(0);
-    sensor1Valid = (r1 != DEVICE_DISCONNECTED_C);
-    if (sensor1Valid) temp1 = r1;
+    sensor1Valid = (r1 != DEVICE_DISCONNECTED_C) && (sensor1Ready || !isBootPlaceholderReading(r1));
+    if (sensor1Valid) {
+      temp1 = r1;
+      sensor1Ready = true;
+    }
 
     const float r2 = twoSensors ? sensors.getTempC(addr2) : temp1;
-    sensor2Valid = twoSensors ? (r2 != DEVICE_DISCONNECTED_C) : sensor1Valid;
-    if (sensor2Valid) temp2 = r2;
+    sensor2Valid = twoSensors
+      ? ((r2 != DEVICE_DISCONNECTED_C) && (sensor2Ready || !isBootPlaceholderReading(r2)))
+      : sensor1Valid;
+    if (sensor2Valid) {
+      temp2 = r2;
+      sensor2Ready = twoSensors ? true : sensor1Ready;
+    }
 
     hist1[histIdx] = temp1;
     hist2[histIdx] = temp2;

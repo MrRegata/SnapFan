@@ -2,9 +2,9 @@ Publicar en GitHub desde este proyecto
 
 Release preparada actualmente
 
-- versión base: 0.4.0
-- tag esperado en GitHub: v0.4.0
-- binario OTA esperado: .pio/build/esp32c3/snapfan-esp32c3-v0.4.0.bin
+- versión base: 0.5.0
+- tag esperado en GitHub: v0.5.0
+- binario OTA esperado: .pio/build/esp32c3/snapfan-esp32c3-v0.5.0.bin
 
 Botón único en VS Code
 
@@ -72,7 +72,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\publish_all.ps1 -Version 0.0.1
 Ejemplo actual para esta release:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\publish_all.ps1 -Version 0.4.0
+powershell -ExecutionPolicy Bypass -File .\tools\publish_all.ps1 -Version 0.5.0
 ```
 
 Esto hace:
@@ -93,7 +93,7 @@ Clave:
 
 Valor actual recomendado para esta publicación:
 
-- custom_firmware_version = 0.4.0
+- custom_firmware_version = 0.5.0
 
 Mientras estés en fase de pruebas puedes seguir usando versiones 0.x.x.
 

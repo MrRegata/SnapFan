@@ -18,7 +18,7 @@ Esta guía sirve para grabar el firmware SnapFan en la placa por USB usando Plat
 - Puerto de subida: COM6
 - Puerto de monitor: COM6
 - Velocidad de monitor: 115200
-- Versión actual del firmware: 0.4.0
+- Versión actual del firmware: 0.5.0
 
 ## Librerías necesarias
 
@@ -65,7 +65,7 @@ platformio device monitor --port COM6 --baud 115200 --filter time
 
 Mensajes útiles esperados:
 
-- Firmware version: v0.4.0
+- Firmware version: v0.5.0
 - DS18B20: X sensor(es)
 - Temperaturas -> Z1: ... C | Z2: ... C
 
@@ -98,7 +98,7 @@ Incidencia real ya observada en este proyecto:
 Cuando la compilación termina correctamente, el script de versionado crea además este archivo:
 
 ```text
-.pio/build/esp32c3/snapfan-esp32c3-v0.4.0.bin
+.pio/build/esp32c3/snapfan-esp32c3-v0.5.0.bin
 ```
 
 Ese es el archivo que se publica en GitHub Releases para actualización OTA.
