@@ -34,6 +34,7 @@
 #include <DallasTemperature.h>
 #include <EEPROM.h>
 #include <PubSubClient.h>
+#include <time.h>
 
 #ifndef APP_VERSION
 #define APP_VERSION "0.0.0"
@@ -45,6 +46,10 @@
 
 const char* FW_VERSION = APP_VERSION;
 const char* FW_GITHUB_REPO = APP_GITHUB_REPO;
+const char* DEVICE_HOSTNAME = "snapfan";
+const char* NTP_TZ = "CET-1CEST,M3.5.0/2,M10.5.0/3";
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.google.com";
 
 // ─── Pines ────────────────────────────────────────────────────────────────────
 // NOTA: Verifica que estos GPIO estén disponibles en ESP32-C3 y no reservados.
@@ -89,6 +94,7 @@ const char* MQTT_CLIENT_ID = "snapfan_esp12";
 
 // ─── Estado ───────────────────────────────────────────────────────────────────
 bool apMode = false;
+bool timeConfigured = false;
 
 // ─── Parámetros de control ────────────────────────────────────────────────────
 bool  z1Auto = true, z2Auto = true;
@@ -110,6 +116,7 @@ bool  twoSensors = false;
 float temp1 = 0.0f, temp2 = 0.0f;
 float peakTemp1 = -127.0f, peakTemp2 = -127.0f;
 bool  fan1Active = false, fan2Active = false;
+bool  sensor1Valid = false, sensor2Valid = false;
 
 // ─── Historial de temperatura (últimos 60 lecturas ≈ 3 min) ──────────────────
 #define HIST_SIZE 60
@@ -205,11 +212,52 @@ void saveSettings() {
     EEPROM.commit();
 }
 
+  String jsonEscape(const String& value) {
+    String out;
+    out.reserve(value.length() + 8);
+    for (size_t i = 0; i < value.length(); ++i) {
+      const char c = value[i];
+      switch (c) {
+        case '\\': out += F("\\\\"); break;
+        case '"': out += F("\\\""); break;
+        case '\n': out += F("\\n"); break;
+        case '\r': out += F("\\r"); break;
+        case '\t': out += F("\\t"); break;
+        default:
+          if (static_cast<uint8_t>(c) >= 0x20) out += c;
+          break;
+      }
+    }
+    return out;
+  }
+
 // ─── JSON de estado ───────────────────────────────────────────────────────────
 String buildJson() {
-  String j; j.reserve(448);
+  String j; j.reserve(640);
+    const bool wifiConnected = WiFi.status() == WL_CONNECTED;
+    const int sensorCount = sensors.getDeviceCount();
+    const String wifiSsid = wifiConnected ? WiFi.SSID() : String();
+    const String wifiIp = wifiConnected ? WiFi.localIP().toString() : String();
+    const String wifiHost = wifiConnected ? String(WiFi.getHostname()) : String(DEVICE_HOSTNAME);
+    const long wifiRssi = wifiConnected ? WiFi.RSSI() : -127;
+    time_t nowTs = 0;
+    if (wifiConnected) {
+      if (!timeConfigured) {
+        configTzTime(NTP_TZ, NTP_SERVER_1, NTP_SERVER_2);
+        timeConfigured = true;
+      }
+      nowTs = time(nullptr);
+      if (nowTs < 946684800) nowTs = 0;
+    }
     j += F("{\"t1\":"); j += String(temp1, 1);
     j += F(",\"t2\":"); j += String(temp2, 1);
+  j += F(",\"wifi\":"); j += wifiConnected ? F("true") : F("false");
+  j += F(",\"ssid\":\""); j += jsonEscape(wifiSsid); j += F("\"");
+  j += F(",\"ip\":\""); j += jsonEscape(wifiIp); j += F("\"");
+  j += F(",\"host\":\""); j += jsonEscape(wifiHost); j += F("\"");
+  j += F(",\"rssi\":"); j += String(wifiRssi);
+  j += F(",\"ntp\":"); j += nowTs > 0 ? F("true") : F("false");
+  j += F(",\"epoch\":"); j += String(static_cast<unsigned long>(nowTs));
   j += F(",\"on1\":"); j += fan1Active ? F("true") : F("false");
   j += F(",\"on2\":"); j += fan2Active ? F("true") : F("false");
     j += F(",\"z1auto\":"); j += z1Auto ? F("true") : F("false");
@@ -222,7 +270,9 @@ String buildJson() {
     j += F(",\"z2hy\":"); j += String(z2Hyst,1);
     j += F(",\"mx1\":"); j += String(peakTemp1, 1);
     j += F(",\"mx2\":"); j += String(peakTemp2, 1);
-    j += F(",\"sc\":"); j += sensors.getDeviceCount();
+      j += F(",\"sc\":"); j += sensorCount;
+      j += F(",\"s1ok\":"); j += sensor1Valid ? F("true") : F("false");
+      j += F(",\"s2ok\":"); j += sensor2Valid ? F("true") : F("false");
       j += F(",\"ver\":\""); j += FW_VERSION;
       j += F("\",\"repo\":\""); j += FW_GITHUB_REPO;
       j += F("\"");
@@ -429,6 +479,79 @@ function doUpload(){
 </body></html>
 )rawliteral";
 
+const char WIFI_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>SnapFan - WiFi</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',sans-serif;background:radial-gradient(circle at top,#17304f 0,#0f172a 42%,#09111e 100%);color:#e2e8f0;min-height:100vh;padding:14px}
+.shell{max-width:980px;margin:0 auto}.top{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:14px}.back{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;background:#1e293b;border:1px solid #334155;border-radius:10px;color:#93c5fd;text-decoration:none;font-size:.84rem;font-weight:600}.back:hover{background:#243244}.lang{padding:7px 10px;border-radius:10px;border:1px solid #334155;background:#1e293b;color:#e2e8f0}
+.hero{background:linear-gradient(135deg,#162339,#1e293b 60%,#0f172a);border:1px solid #334155;border-radius:18px;padding:18px 18px 16px;margin-bottom:14px;box-shadow:0 14px 40px #0005}.eyebrow{font-size:.72rem;letter-spacing:2px;text-transform:uppercase;color:#60a5fa;margin-bottom:6px}.hero h1{font-size:1.35rem;color:#eff6ff;margin-bottom:6px}.hero p{font-size:.86rem;color:#94a3b8;line-height:1.5}
+.statusgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:14px}.statuscard{background:#0f172a;border:1px solid #253246;border-radius:12px;padding:12px;text-align:center}.statusk{font-size:.7rem;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}.statusv{font-size:.98rem;font-weight:700;color:#e2e8f0;word-break:break-word}
+.content{display:grid;grid-template-columns:1.15fr .85fr;gap:14px}.panel{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:16px}.panel h2{color:#bfdbfe;font-size:.88rem;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px}.scanbar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:12px}.scanmsg{font-size:.8rem;color:#94a3b8}.btn{border:none;border-radius:10px;padding:10px 14px;font-size:.84rem;font-weight:700;cursor:pointer}.btn.blue{background:#2563eb;color:#eff6ff}.btn.blue:hover{background:#1d4ed8}.btn.dark{background:#0f172a;color:#93c5fd;border:1px solid #334155}.btn.dark:hover{background:#162235}
+.nets{display:grid;gap:10px;max-height:460px;overflow:auto;padding-right:4px}.net{background:#0f172a;border:1px solid #253246;border-radius:12px;padding:12px;display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;transition:transform .18s ease,border-color .18s ease,background .18s ease}.net:hover{transform:translateY(-1px);border-color:#60a5fa;background:#142033}.net.sel{border-color:#f59e0b;box-shadow:0 0 0 1px #f59e0b inset}.netname{font-size:.96rem;font-weight:700;color:#eff6ff;margin-bottom:4px;word-break:break-word}.netmeta{font-size:.74rem;color:#94a3b8;display:flex;gap:8px;flex-wrap:wrap}.pill{display:inline-flex;align-items:center;gap:4px;padding:4px 8px;border-radius:999px;background:#182437;border:1px solid #2a3a53;color:#cbd5e1}.sec{background:#052e16;border-color:#14532d;color:#bbf7d0}.open{background:#1f2937;border-color:#374151;color:#d1d5db}
+.formgrid{display:grid;gap:12px}.field label{display:block;font-size:.76rem;color:#94a3b8;margin-bottom:5px}.field input{width:100%;padding:10px 11px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#e2e8f0;font-size:.92rem}.field input:focus{outline:none;border-color:#60a5fa}.note{font-size:.78rem;color:#94a3b8;line-height:1.5}.toast{display:none;margin-top:12px;padding:11px 12px;border-radius:12px;font-size:.84rem}.toast.show{display:block}.toast.ok{background:#052e16;border:1px solid #166534;color:#86efac}.toast.err{background:#450a0a;border:1px solid #991b1b;color:#fca5a5}
+@media (max-width: 820px){.content{grid-template-columns:1fr}.nets{max-height:none}}
+</style></head><body>
+<div class="shell">
+  <div class="top">
+    <a class="back" href="/" id="backBtn">&#8592; Volver al panel</a>
+    <select class="lang" id="langSel" onchange="setLang(this.value)"><option value="es">🇪🇸 ES</option><option value="en">🇬🇧 EN</option></select>
+  </div>
+  <section class="hero">
+    <div class="eyebrow" id="heroEyebrow">Administrador WiFi</div>
+    <h1 id="heroTitle">Conecta SnapFan a otra red</h1>
+    <p id="heroText">Pulsa en una red detectada para rellenar el SSID, introduce la contraseña si hace falta y guarda. El equipo reiniciará para conectarse.</p>
+    <div class="statusgrid">
+      <div class="statuscard"><div class="statusk" id="kSsid">SSID actual</div><div class="statusv" id="curSsid">--</div></div>
+      <div class="statuscard"><div class="statusk" id="kIp">IP actual</div><div class="statusv" id="curIp">--</div></div>
+      <div class="statuscard"><div class="statusk" id="kSignal">Señal</div><div class="statusv" id="curSignal">--</div></div>
+      <div class="statuscard"><div class="statusk" id="kHost">Host</div><div class="statusv" id="curHost">--</div></div>
+      <div class="statuscard"><div class="statusk" id="kClock">Hora</div><div class="statusv" id="curClock">--</div></div>
+      <div class="statuscard"><div class="statusk" id="kSync">NTP</div><div class="statusv" id="curSync">--</div></div>
+    </div>
+  </section>
+  <div class="content">
+    <section class="panel">
+      <div class="scanbar">
+        <h2 id="scanTitle">Redes detectadas</h2>
+        <button class="btn dark" id="scanBtn" onclick="scanWifi()">Escanear de nuevo</button>
+      </div>
+      <div class="scanmsg" id="scanMsg">Buscando redes WiFi cercanas...</div>
+      <div class="nets" id="scanList"></div>
+    </section>
+    <section class="panel">
+      <h2 id="formTitle">Conectar a la red</h2>
+      <div class="formgrid">
+        <div class="field"><label id="lblSsid" for="ssidInput">SSID</label><input id="ssidInput" maxlength="32" autocomplete="off"></div>
+        <div class="field"><label id="lblPass" for="passInput">Contraseña</label><input id="passInput" type="password" maxlength="64" autocomplete="off"></div>
+        <button class="btn blue" id="saveBtn" onclick="saveWifi()">Guardar y reconectar</button>
+        <p class="note" id="wifiNote">Si la red es abierta, deja la contraseña vacía. Al guardar, el ESP32-C3 reiniciará e intentará enlazar con esa red.</p>
+        <div class="toast" id="toast"></div>
+      </div>
+    </section>
+  </div>
+</div>
+<script>
+const TR={es:{back:'\u2190 Volver al panel',eyebrow:'Administrador WiFi',title:'Conecta SnapFan a otra red',hero:'Pulsa en una red detectada para rellenar el SSID, introduce la contraseña si hace falta y guarda. El equipo reiniciará para conectarse.',ssidNow:'SSID actual',ipNow:'IP actual',signal:'Señal',host:'Host',clock:'Hora',sync:'NTP',scanTitle:'Redes detectadas',scanBtn:'Escanear de nuevo',scanIdle:'Selecciona una red o lanza un nuevo escaneo.',scanRun:'Buscando redes WiFi cercanas...',scanNone:'No se han encontrado redes visibles.',scanErr:'No se pudo escanear ahora mismo.',formTitle:'Conectar a la red',lblSsid:'SSID',lblPass:'Contraseña',save:'Guardar y reconectar',note:'Si la red es abierta, deja la contraseña vacía. Al guardar, el ESP32-C3 reiniciará e intentará enlazar con esa red.',selectHint:'Red seleccionada',open:'Abierta',secure:'Protegida',saved:'WiFi guardado. Reiniciando...',saveErr:'No se pudo guardar la nueva WiFi.',ssidReq:'Introduce el SSID',noWifi:'Sin WiFi',noTime:'Sin hora',synced:'Sincronizada',unsynced:'Pendiente',dayClock:'Hora local'},en:{back:'\u2190 Back to dashboard',eyebrow:'WiFi manager',title:'Connect SnapFan to another network',hero:'Tap a detected network to fill the SSID, enter the password if needed, and save. The device will reboot and reconnect.',ssidNow:'Current SSID',ipNow:'Current IP',signal:'Signal',host:'Host',clock:'Time',sync:'NTP',scanTitle:'Detected networks',scanBtn:'Scan again',scanIdle:'Select a network or start a new scan.',scanRun:'Scanning nearby WiFi networks...',scanNone:'No visible networks were found.',scanErr:'WiFi scan failed right now.',formTitle:'Connect to network',lblSsid:'SSID',lblPass:'Password',save:'Save and reconnect',note:'If the network is open, leave the password empty. After saving, the ESP32-C3 will reboot and try to join that network.',selectHint:'Selected network',open:'Open',secure:'Secured',saved:'WiFi saved. Restarting...',saveErr:'Could not save the new WiFi.',ssidReq:'Enter SSID',noWifi:'No WiFi',noTime:'No time',synced:'Synced',unsynced:'Pending',dayClock:'Local time'}};
+let LG=localStorage.getItem('lang')||'es';
+let scanResults=[];
+function t(k){return TR[LG][k]||k;}
+function showToast(msg,kind){const el=document.getElementById('toast');el.textContent=msg;el.className='toast show '+kind;}
+function clearToast(){const el=document.getElementById('toast');el.className='toast';el.textContent='';}
+function formatClock(epoch){if(!epoch)return t('noTime');const loc=LG==='es'?'es-ES':'en-GB';return new Date(epoch*1000).toLocaleString(loc,{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+function formatSignal(rssi){if(typeof rssi!=='number'||rssi<=-126)return '--';const quality=Math.max(0,Math.min(100,Math.round(2*(rssi+100))));return rssi+' dBm · '+quality+'%';}
+function securityLabel(secure){return secure?t('secure'):t('open');}
+function renderNetworks(){const host=document.getElementById('scanList');host.innerHTML='';if(!scanResults.length){document.getElementById('scanMsg').textContent=t('scanNone');return;}document.getElementById('scanMsg').textContent=t('scanIdle');const selected=document.getElementById('ssidInput').value.trim();scanResults.forEach(net=>{const row=document.createElement('button');row.type='button';row.className='net'+(selected===net.ssid?' sel':'');row.onclick=()=>selectNetwork(net);const left=document.createElement('div');const name=document.createElement('div');name.className='netname';name.textContent=net.ssid||'(hidden)';const meta=document.createElement('div');meta.className='netmeta';meta.innerHTML='<span class="pill">📶 '+formatSignal(net.rssi)+'</span><span class="pill '+(net.secure?'sec':'open')+'">'+securityLabel(net.secure)+'</span><span class="pill">CH '+net.channel+'</span>';left.appendChild(name);left.appendChild(meta);const right=document.createElement('div');right.className='pill';right.textContent=t('selectHint');row.appendChild(left);row.appendChild(right);host.appendChild(row);});}
+function selectNetwork(net){document.getElementById('ssidInput').value=net.ssid||'';document.getElementById('passInput').focus();renderNetworks();clearToast();}
+async function scanWifi(){clearToast();document.getElementById('scanMsg').textContent=t('scanRun');document.getElementById('scanList').innerHTML='';try{const res=await fetch('/wifi/scan');if(!res.ok)throw new Error('scan');const data=await res.json();scanResults=(data.nets||[]).filter(net=>net.ssid);renderNetworks();}catch(e){scanResults=[];renderNetworks();document.getElementById('scanMsg').textContent=t('scanErr');showToast(t('scanErr'),'err');}}
+async function loadStatus(){try{const d=await(await fetch('/status')).json();document.getElementById('curSsid').textContent=d.ssid||t('noWifi');document.getElementById('curIp').textContent=d.ip||'--';document.getElementById('curSignal').textContent=formatSignal(Number(d.rssi));document.getElementById('curHost').textContent=d.host||'--';document.getElementById('curClock').textContent=formatClock(parseInt(d.epoch)||0);document.getElementById('curSync').textContent=d.ntp?t('synced'):t('unsynced');}catch(e){}}
+async function saveWifi(){const ssid=document.getElementById('ssidInput').value.trim();const pass=document.getElementById('passInput').value;if(!ssid){showToast(t('ssidReq'),'err');return;}try{const res=await fetch('/savewifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass)+'&noreset=1'});if(!res.ok)throw new Error('save');showToast(t('saved'),'ok');setTimeout(()=>{window.location='/';},2500);}catch(e){showToast(t('saveErr'),'err');}}
+function setLang(lang){LG=lang;localStorage.setItem('lang',lang);document.documentElement.lang=lang;document.getElementById('langSel').value=lang;document.getElementById('backBtn').textContent=t('back');document.getElementById('heroEyebrow').textContent=t('eyebrow');document.getElementById('heroTitle').textContent=t('title');document.getElementById('heroText').textContent=t('hero');document.getElementById('kSsid').textContent=t('ssidNow');document.getElementById('kIp').textContent=t('ipNow');document.getElementById('kSignal').textContent=t('signal');document.getElementById('kHost').textContent=t('host');document.getElementById('kClock').textContent=t('clock');document.getElementById('kSync').textContent=t('sync');document.getElementById('scanTitle').textContent=t('scanTitle');document.getElementById('scanBtn').textContent=t('scanBtn');document.getElementById('formTitle').textContent=t('formTitle');document.getElementById('lblSsid').textContent=t('lblSsid');document.getElementById('lblPass').textContent=t('lblPass');document.getElementById('saveBtn').textContent=t('save');document.getElementById('wifiNote').textContent=t('note');renderNetworks();loadStatus();if(!scanResults.length){document.getElementById('scanMsg').textContent=t('scanRun');}}
+window.addEventListener('load',()=>{setLang(LG);loadStatus();scanWifi();});
+</script></body></html>
+)rawliteral";
+
 // ─── Página web principal ─────────────────────────────────────────────────────
 const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -436,34 +559,43 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',sans-serif;background:radial-gradient(circle at top,#1e3a5f 0,#111827 35%,#0b1220 100%);color:#e2e8f0;min-height:100vh;padding:12px 16px}
-.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px}.brand{display:flex;align-items:center;gap:10px}.brand svg{width:38px;height:38px;flex-shrink:0}.brand-txt h1{font-size:1.05rem;font-weight:700;color:#60a5fa;line-height:1.1}.brand-txt p{font-size:.68rem;color:#64748b}.topright{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.topbar{display:grid;grid-template-columns:auto minmax(260px,1fr) auto;align-items:center;margin-bottom:14px;gap:10px}.brand{display:flex;align-items:center;gap:10px}.brand svg{width:38px;height:38px;flex-shrink:0}.brand-txt h1{font-size:1.05rem;font-weight:700;color:#60a5fa;line-height:1.1}.brand-txt p{font-size:.68rem;color:#64748b}.topright{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}.topnet{display:grid;grid-template-columns:repeat(4,minmax(90px,1fr));gap:8px;min-width:0}.topnet-item{background:#1e2535;border:1px solid #2d3a52;border-radius:10px;padding:8px 10px;text-align:center;min-width:0}.topnet-k{font-size:.63rem;color:#94a3b8;letter-spacing:.4px;text-transform:uppercase;margin-bottom:3px}.topnet-v{font-size:.8rem;font-weight:700;color:#e2e8f0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .langsel,.tbtn,input{border-radius:8px}.langsel{padding:5px 8px;border:1px solid #2d3a52;background:#1e2535;color:#e2e8f0;font-size:.78rem;cursor:pointer;outline:none}.tbtn{padding:6px 12px;border:1px solid #2d3a52;background:#1e2535;font-size:.78rem;cursor:pointer;font-weight:600;text-decoration:none;display:inline-flex;align-items:center;gap:5px;color:#e2e8f0}.tbtn:hover{background:#273550}.tbtn.blue{color:#60a5fa;border-color:#1d4ed8}.tbtn.orange{color:#fb923c}.tbtn.red{color:#f87171}.tbtn.green{color:#4ade80;border-color:#166534}.btn-ico{font-size:.95rem;line-height:1}.creator{margin-top:6px;text-align:center}.creator a,.social-links a{color:#64748b;font-size:.68rem;text-decoration:none}.creator a:hover,.social-links a:hover{color:#60a5fa}.creator strong{color:#cbd5e1}.social-links{margin-top:4px;text-align:center;display:flex;justify-content:center;gap:14px;flex-wrap:wrap}
 .mbar{display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:14px;flex-wrap:wrap;padding:10px;background:#1e2535;border-radius:12px;border:1px solid #2d3a52}.mbadge{padding:4px 12px;border-radius:20px;font-weight:700;font-size:.8rem}.mauto{background:#065f46;color:#6ee7b7}.mman{background:#7c2d12;color:#fca5a5}.btnm{padding:6px 14px;border:none;border-radius:8px;font-size:.82rem;cursor:pointer;font-weight:600}.btna{background:#3b82f6;color:#fff}.btnm2{background:#dc2626;color:#fff}.bsm{padding:4px 10px!important;font-size:.76rem!important}
+.sensor-alert{display:none;max-width:860px;margin:0 auto 14px;padding:12px 14px;background:#4a1d1f;color:#fee2e2;border:1px solid #7f1d1d;border-radius:12px;font-size:.82rem;line-height:1.45}.sensor-alert.show{display:block}.sensor-alert strong{color:#fecaca}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px;max-width:860px;margin:0 auto}.card{background:#1e2535;border-radius:14px;padding:18px;border:1px solid #2d3a52}.card h2{color:#93c5fd;font-size:.8rem;text-transform:uppercase;letter-spacing:2px;margin-bottom:10px;text-align:center}.zmode-bar{display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:10px}
 .stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px 0}.stat{text-align:center;background:#0f172a;border:1px solid #263349;border-radius:10px;padding:10px 8px}.sv{font-size:1.8rem;font-weight:700}.sl{font-size:.68rem;color:#94a3b8;margin-top:2px}.cool{color:#34d399}.warm{color:#fbbf24}.hot{color:#f87171}.state{color:#60a5fa}
 .fan-state{display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:12px}.dot{width:11px;height:11px;border-radius:50%;flex-shrink:0;transition:all .5s}.dot-on{background:#22c55e;box-shadow:0 0 8px #22c55e88}.dot-off{background:#374151}.fan-lbl{font-size:.78rem;font-weight:700;letter-spacing:1px}.fan-on-txt{color:#22c55e}.fan-off-txt{color:#6b7280}
 .chart-wrap{position:relative;background:#0f172a;border-radius:8px;margin-bottom:12px;overflow:hidden;height:80px}canvas.chart{position:absolute;top:0;left:0;width:100%;height:100%}.chart-lbl{position:absolute;bottom:2px;left:6px;font-size:7px;color:#475569;pointer-events:none}.chart-lbl-r{position:absolute;bottom:2px;right:6px;font-size:7px;color:#475569;pointer-events:none}
 .sec{border-top:1px solid #2d3a52;padding-top:12px;margin-top:2px}.st{font-size:.7rem;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}.r2{display:grid;grid-template-columns:1fr 1fr;gap:8px}label{font-size:.74rem;color:#94a3b8;display:block;margin-bottom:2px}input[type=number],input[type=text],input[type=password]{width:100%;padding:7px 8px;border:1px solid #2d3a52;background:#0f172a;color:#e2e8f0;font-size:.88rem;outline:none}input:focus{border-color:#3b82f6}
 .sv2{width:100%;margin-top:12px;padding:8px;background:#1d4ed8;color:#fff;border:none;border-radius:8px;font-size:.88rem;cursor:pointer}.sv2:hover{background:#2563eb}.power-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.power-btn{padding:10px;border:none;border-radius:8px;font-size:.82rem;font-weight:700;cursor:pointer;transition:opacity .2s ease,filter .2s ease}.power-btn:disabled{opacity:.28;filter:saturate(.35) brightness(.7);cursor:not-allowed}.power-on{background:#166534;color:#dcfce7}.power-off{background:#7f1d1d;color:#fee2e2}
-.wifi-panel{display:none;max-width:860px;margin:14px auto 0}.wifi-card{background:#1e2535;border-radius:14px;padding:18px;border:1px solid #2d3a52}.wifi-card h2{color:#93c5fd;font-size:.8rem;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px;text-align:center}.wifi-r2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
 .overlay{display:none;position:fixed;inset:0;background:#000a;z-index:100;align-items:center;justify-content:center}.overlay.show{display:flex}.modal{background:#1e2535;border-radius:14px;padding:24px;width:90%;max-width:340px;border:1px solid #2d3a52;text-align:center}.modal p{margin-bottom:16px;font-size:.9rem;color:#94a3b8}.modal-btns{display:flex;gap:10px;justify-content:center}.modal-btns button{padding:8px 20px;border:none;border-radius:8px;font-size:.88rem;cursor:pointer;font-weight:600}
 footer{text-align:center;color:#475569;font-size:.66rem;margin-top:16px}
+@media (max-width: 980px){.topbar{grid-template-columns:1fr;justify-items:stretch}.topnet{grid-template-columns:repeat(2,minmax(120px,1fr))}.topright{justify-content:flex-start}}
+@media (max-width: 560px){.topnet{grid-template-columns:1fr 1fr}.topnet-v{font-size:.76rem}}
 </style></head><body>
 <div class="topbar">
   <div class="brand">
     <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="6" y="46" width="52" height="13" rx="3" fill="#1e3a5f" stroke="#60a5fa" stroke-width="2"/><rect x="10" y="38" width="44" height="10" rx="2" fill="#0f2a47" stroke="#3b82f6" stroke-width="1.5"/><rect x="16" y="30" width="32" height="10" rx="2" fill="#0f2a47" stroke="#3b82f6" stroke-width="1.5"/><rect x="22" y="22" width="20" height="10" rx="2" fill="#0f2a47" stroke="#60a5fa" stroke-width="1.5"/><line x1="26" y1="22" x2="26" y2="6" stroke="#60a5fa" stroke-width="2" stroke-linecap="round"/><line x1="32" y1="22" x2="32" y2="6" stroke="#60a5fa" stroke-width="2" stroke-linecap="round"/><line x1="38" y1="22" x2="38" y2="6" stroke="#60a5fa" stroke-width="2" stroke-linecap="round"/></svg>
     <div class="brand-txt"><h1>Snapmaker U1</h1><p>Fan Control 24V · ESP32-C3</p><div style="font-size:.68rem;color:#94a3b8;margin-top:2px">Firmware <span id="fwVersion">v0.0.0</span></div></div>
   </div>
+  <div class="topnet">
+    <div class="topnet-item"><div class="topnet-k" id="lblNetSsid">SSID</div><div class="topnet-v" id="netSsid">--</div></div>
+    <div class="topnet-item"><div class="topnet-k" id="lblNetIp">IP</div><div class="topnet-v" id="netIp">--</div></div>
+    <div class="topnet-item"><div class="topnet-k" id="lblNetSignal">Señal</div><div class="topnet-v" id="netSignal">--</div></div>
+    <div class="topnet-item"><div class="topnet-k" id="lblNetTime">Hora</div><div class="topnet-v" id="netTime">--:--:--</div></div>
+  </div>
   <div class="topright">
     <select class="langsel" id="langSel" onchange="setLang(this.value)"><option value="es">🇪🇸 ES</option><option value="en">🇬🇧 EN</option></select>
     <button class="tbtn green" onclick="checkForUpdates(true)" id="btnUpdates"><span class="btn-ico">⬇️</span><span>Updates</span></button>
     <button class="tbtn blue" onclick="showOTA()" id="btnOTA"><span class="btn-ico">📦</span><span>OTA</span></button>
-    <button class="tbtn orange" onclick="toggleWifiPanel()" id="btnWifi"><span class="btn-ico">📶</span><span>WiFi</span></button>
+    <button class="tbtn orange" onclick="openWifiPage()" id="btnWifi"><span class="btn-ico">📶</span><span>WiFi</span></button>
     <button class="tbtn green" onclick="confirmResetPeak()" id="btnResetPeak"><span class="btn-ico">🌡️</span><span>T.max</span></button>
     <button class="tbtn red" onclick="confirmRestart()" id="btnRestart"><span class="btn-ico">🔄</span><span>Reiniciar ESP</span></button>
   </div>
 </div>
 <div class="mbar"><span style="font-size:.74rem;color:#94a3b8" id="lblAllZones">Todas las zonas:</span><button class="btnm btna bsm" id="btnAllAuto" onclick="setAllMode('auto')">AUTO</button><button class="btnm btnm2 bsm" id="btnAllMan" onclick="setAllMode('manual')">MANUAL</button></div>
+<div class="sensor-alert" id="sensorAlert"></div>
 <div class="grid">
   <div class="card">
     <h2 id="z1title">&#9881; Drivers de Motores</h2><div id="sensInfo1" style="text-align:center;font-size:.72rem;color:#64748b;margin-bottom:2px">&#127777;&#65039; --</div>
@@ -484,7 +616,6 @@ footer{text-align:center;color:#475569;font-size:.66rem;margin-top:16px}
     <form onsubmit="saveZone(event,2)"><div class="sec" style="border-top:none;padding-top:8px"><div class="st" id="lblAuto2">Control autom&aacute;tico</div><div class="r2"><div><label id="lblTHigh2">Umbral ON (&deg;C)</label><input type="number" id="z2th" min="20" max="90" step="0.5" value="50"></div><div><label id="lblHyst2">Hist&eacute;resis (&deg;C)</label><input type="number" id="z2hy" min="1" max="20" step="0.5" value="10"></div></div></div><div class="sec"><div class="st" id="lblManual2">Control manual</div><div class="power-actions"><button type="button" class="power-btn power-on" id="z2on" onclick="setManual(2,1)">Encender</button><button type="button" class="power-btn power-off" id="z2off" onclick="setManual(2,0)">Apagar</button></div></div><button class="sv2" type="submit" id="btnSaveZ2">Guardar Zona 2</button></form>
   </div>
 </div>
-<div class="wifi-panel" id="wifiPanel"><div class="wifi-card"><h2 id="wifiTitle">Cambiar WiFi</h2><div class="wifi-r2"><div><label id="lblNewSSID">SSID</label><input type="text" id="newSSID" maxlength="32" autocomplete="off"></div><div><label id="lblNewPass">Contrase&ntilde;a</label><input type="password" id="newPass" maxlength="64" autocomplete="off"></div></div><button class="sv2" onclick="saveWifi()" id="btnSaveWifi">Guardar y Reconectar</button><p style="font-size:.7rem;color:#475569;margin-top:8px;text-align:center" id="wifiNote">El ESP se reconectar&aacute; a la nueva red y reiniciar&aacute;.</p></div></div>
 <div class="overlay" id="otaOverlay"><div class="modal"><p id="otaMsg">Abriendo p&aacute;gina OTA...</p><div class="modal-btns"><button style="background:#1d4ed8;color:#fff" onclick="window.location='/update';hideOTA()">Ir a OTA</button><button style="background:#374151;color:#e2e8f0" onclick="hideOTA()">Cancelar</button></div></div></div>
 <div class="overlay" id="peakOverlay"><div class="modal"><p id="peakMsg">&iquest;Borrar T. m&aacute;x registradas?</p><div class="modal-btns"><button style="background:#16a34a;color:#fff" onclick="doResetPeak()">S&iacute;</button><button style="background:#374151;color:#e2e8f0" onclick="hidePeakRst()">No</button></div></div></div>
 <div class="overlay" id="rstOverlay"><div class="modal"><p id="rstMsg">&iquest;Reiniciar el ESP ahora?</p><div class="modal-btns"><button style="background:#dc2626;color:#fff" onclick="doRestart()">S&iacute;</button><button style="background:#374151;color:#e2e8f0" onclick="hideRst()">No</button></div></div></div>
@@ -492,21 +623,24 @@ footer{text-align:center;color:#475569;font-size:.66rem;margin-top:16px}
 <div class="creator"><a href="#" onclick="return false;">Creado por <strong>Regata</strong></a></div>
 <div class="social-links"><a href="https://t.me/regata3dprint" target="_blank" rel="noopener noreferrer">📨 Telegram @regata3dprint</a><a href="https://instagram.com/regata3dprint" target="_blank" rel="noopener noreferrer">📷 Instagram @regata3dprint</a></div>
 <script>
-const TR={es:{z1title:'&#9881; Drivers de Motores',z2title:'&#9889; Fuente de Alimentaci\u00f3n',lblAllZones:'Todas las zonas:',lblTemp:'Temperatura',lblMode:'Modo',lblAuto:'Control autom\u00e1tico',lblTHigh:'Umbral ON (\u00b0C)',lblHyst:'Hist\u00e9resis (\u00b0C)',lblPeakT:'T. m\u00e1x',lblManual:'Control manual',btnSaveZ:'Guardar Zona ',btnOTA:'OTA',btnWifi:'WiFi',btnRestart:'Reiniciar ESP',btnUpdates:'Buscar actualizaciones',btnAllAuto:'AUTO',btnAllMan:'MANUAL',btnOn:'Encender',btnOff:'Apagar',modeAuto:'AUTO',modeManual:'MANUAL',fanOn:'ENCENDIDO',fanOff:'APAGADO',wifiTitle:'Cambiar Red WiFi',lblNewSSID:'SSID',lblNewPass:'Contrase\u00f1a',btnSaveWifi:'Guardar y Reconectar',wifiNote:'El ESP se reconectar\u00e1 a la nueva red y reiniciar\u00e1.',otaMsg:'Abriendo p\u00e1gina OTA...',rstMsg:'\u00bfReiniciar el ESP ahora?',peakMsg:'\u00bfBorrar T. m\u00e1x registradas?',btnResetPeak:'T.max',sensNone:'Sin sensor',sens1:'Sensor',sensZ1:'Zona 1',sensZ2:'Zona 2',sensShared:'Zonas 1+2',xlbl:'-3min',xnow:'ahora',footer:'ESP32-C3 · Snapmaker U1 Fan Control 24V · {version} · Auto-refresh 3 s',upToDate:'Ya est\u00e1s en la \u00faltima versi\u00f3n',updateAvail:'Hay una nueva versi\u00f3n disponible: {latest}. Tu firmware actual es {current}. \u00bfQuieres abrir la descarga?',updateOpenRelease:'No se encontr\u00f3 un .bin en la release. Se abrir\u00e1 la p\u00e1gina de GitHub.',updateError:'No se pudo comprobar GitHub ahora mismo.'},en:{z1title:'&#9881; Motor Drivers',z2title:'&#9889; Power Supply',lblAllZones:'All zones:',lblTemp:'Temperature',lblMode:'Mode',lblAuto:'Automatic control',lblTHigh:'ON threshold (\u00b0C)',lblHyst:'Hysteresis (\u00b0C)',lblPeakT:'Peak T',lblManual:'Manual control',btnSaveZ:'Save Zone ',btnOTA:'OTA',btnWifi:'WiFi',btnRestart:'Restart ESP',btnUpdates:'Check updates',btnAllAuto:'AUTO',btnAllMan:'MANUAL',btnOn:'Turn on',btnOff:'Turn off',modeAuto:'AUTO',modeManual:'MANUAL',fanOn:'ON',fanOff:'OFF',wifiTitle:'Change WiFi Network',lblNewSSID:'SSID',lblNewPass:'Password',btnSaveWifi:'Save & Reconnect',wifiNote:'The ESP will reconnect to the new network and restart.',otaMsg:'Opening OTA page...',rstMsg:'Restart the ESP now?',peakMsg:'Clear recorded peak temperatures?',btnResetPeak:'Peak T',sensNone:'No sensor',sens1:'Sensor',sensZ1:'Zone 1',sensZ2:'Zone 2',sensShared:'Zones 1+2',xlbl:'-3min',xnow:'now',footer:'ESP32-C3 · Snapmaker U1 Fan Control 24V · {version} · Auto-refresh 3 s',upToDate:'You already have the latest version',updateAvail:'A new version is available: {latest}. Your current firmware is {current}. Open the download?',updateOpenRelease:'No .bin asset was found in the release. Opening GitHub release page.',updateError:'GitHub could not be checked right now.'}};
+const TR={es:{z1title:'&#9881; Drivers de Motores',z2title:'&#9889; Fuente de Alimentaci\u00f3n',lblAllZones:'Todas las zonas:',lblTemp:'Temperatura',lblMode:'Modo',lblAuto:'Control autom\u00e1tico',lblTHigh:'Umbral ON (\u00b0C)',lblHyst:'Hist\u00e9resis (\u00b0C)',lblPeakT:'T. m\u00e1x',lblManual:'Control manual',btnSaveZ:'Guardar Zona ',btnOTA:'OTA',btnWifi:'WiFi',btnRestart:'Reiniciar ESP',btnUpdates:'Buscar actualizaciones',btnAllAuto:'AUTO',btnAllMan:'MANUAL',btnOn:'Encender',btnOff:'Apagar',modeAuto:'AUTO',modeManual:'MANUAL',fanOn:'ENCENDIDO',fanOff:'APAGADO',otaMsg:'Abriendo p\u00e1gina OTA...',rstMsg:'\u00bfReiniciar el ESP ahora?',peakMsg:'\u00bfBorrar T. m\u00e1x registradas?',btnResetPeak:'T.max',sensNone:'Sin sensor',sens1:'Sensor',sensZ1:'Zona 1',sensZ2:'Zona 2',sensShared:'Zonas 1+2',sensAlertNone:'No se detecta ning\u00fan DS18B20. Revisa GPIO4, 3.3V, GND y la resistencia pull-up de 4.7k.',sensAlertMissing:'Hay sensores DS18B20 sin lectura v\u00e1lida. Revisa cableado, conexiones o el propio sensor.',sensAlertZ1:'La zona 1 no tiene lectura v\u00e1lida.',sensAlertZ2:'La zona 2 no tiene lectura v\u00e1lida.',xlbl:'-3min',xnow:'ahora',footer:'ESP32-C3 · Snapmaker U1 Fan Control 24V · {version} · Auto-refresh 3 s',upToDate:'Ya est\u00e1s en la \u00faltima versi\u00f3n',updateAvail:'Hay una nueva versi\u00f3n disponible: {latest}. Tu firmware actual es {current}. \u00bfQuieres abrir la descarga?',updateOpenRelease:'No se encontr\u00f3 un .bin en la release. Se abrir\u00e1 la p\u00e1gina de GitHub.',updateError:'No se pudo comprobar GitHub ahora mismo.'},en:{z1title:'&#9881; Motor Drivers',z2title:'&#9889; Power Supply',lblAllZones:'All zones:',lblTemp:'Temperature',lblMode:'Mode',lblAuto:'Automatic control',lblTHigh:'ON threshold (\u00b0C)',lblHyst:'Hysteresis (\u00b0C)',lblPeakT:'Peak T',lblManual:'Manual control',btnSaveZ:'Save Zone ',btnOTA:'OTA',btnWifi:'WiFi',btnRestart:'Restart ESP',btnUpdates:'Check updates',btnAllAuto:'AUTO',btnAllMan:'MANUAL',btnOn:'Turn on',btnOff:'Turn off',modeAuto:'AUTO',modeManual:'MANUAL',fanOn:'ON',fanOff:'OFF',otaMsg:'Opening OTA page...',rstMsg:'Restart the ESP now?',peakMsg:'Clear recorded peak temperatures?',btnResetPeak:'Peak T',sensNone:'No sensor',sens1:'Sensor',sensZ1:'Zone 1',sensZ2:'Zone 2',sensShared:'Zones 1+2',sensAlertNone:'No DS18B20 detected. Check GPIO4, 3.3V, GND, and the 4.7k pull-up resistor.',sensAlertMissing:'There are DS18B20 sensors without a valid reading. Check wiring, connections, or the sensor itself.',sensAlertZ1:'Zone 1 has no valid reading.',sensAlertZ2:'Zone 2 has no valid reading.',xlbl:'-3min',xnow:'now',footer:'ESP32-C3 · Snapmaker U1 Fan Control 24V · {version} · Auto-refresh 3 s',upToDate:'You already have the latest version',updateAvail:'A new version is available: {latest}. Your current firmware is {current}. Open the download?',updateOpenRelease:'No .bin asset was found in the release. Opening GitHub release page.',updateError:'GitHub could not be checked right now.'}};
 let LG=localStorage.getItem('lang')||'es';
 let FW_VER='v0.0.0';
 let FW_REPO='MrRegata/SnapFan';
 let updatePrompted=false;
 let updateDismissedVersion=localStorage.getItem('updateDismissedVersion')||'';
+function netText(key){const isEs=LG==='es';return{ssid:'SSID',ip:'IP',signal:isEs?'Señal':'Signal',time:isEs?'Hora':'Time',noWifi:isEs?'Sin WiFi':'No WiFi',noTime:isEs?'Sin hora':'No time',noSignal:isEs?'Sin señal':'No signal'}[key];}
 function fmt(tpl,vars){return tpl.replace(/\{(\w+)\}/g,(_,k)=>vars[k]??'');}
 function normVer(v){return String(v||'').trim().replace(/^v/i,'');}
 function cmpVer(a,b){const pa=normVer(a).split('.').map(v=>parseInt(v,10)||0);const pb=normVer(b).split('.').map(v=>parseInt(v,10)||0);const len=Math.max(pa.length,pb.length);for(let i=0;i<len;i++){const av=pa[i]||0,bv=pb[i]||0;if(av>bv)return 1;if(av<bv)return -1;}return 0;}
-function setLang(l){LG=l;localStorage.setItem('lang',l);const t=TR[l];document.getElementById('langSel').value=l;document.getElementById('z1title').innerHTML=t.z1title;document.getElementById('z2title').innerHTML=t.z2title;document.getElementById('lblAllZones').textContent=t.lblAllZones;document.getElementById('btnAllAuto').textContent=t.btnAllAuto;document.getElementById('btnAllMan').textContent=t.btnAllMan;document.getElementById('btnUpdates').innerHTML='<span class="btn-ico">⬇️</span><span>'+t.btnUpdates+'</span>';document.getElementById('btnOTA').innerHTML='<span class="btn-ico">📦</span><span>'+t.btnOTA+'</span>';document.getElementById('btnWifi').innerHTML='<span class="btn-ico">📶</span><span>'+t.btnWifi+'</span>';document.getElementById('btnRestart').innerHTML='<span class="btn-ico">🔄</span><span>'+t.btnRestart+'</span>';document.getElementById('btnResetPeak').innerHTML='<span class="btn-ico">🌡️</span><span>'+t.btnResetPeak+'</span>';for(const z of['1','2']){document.getElementById('lblTemp'+z).textContent=t.lblTemp;document.getElementById('lblMode'+z).textContent=t.lblMode;document.getElementById('lblAuto'+z).textContent=t.lblAuto;document.getElementById('lblTHigh'+z).textContent=t.lblTHigh;document.getElementById('lblHyst'+z).textContent=t.lblHyst;document.getElementById('lblPeakT'+z).textContent=t.lblPeakT;document.getElementById('lblManual'+z).textContent=t.lblManual;document.getElementById('btnSaveZ'+z).textContent=t.btnSaveZ+z;document.getElementById('z'+z+'on').textContent=t.btnOn;document.getElementById('z'+z+'off').textContent=t.btnOff;document.getElementById('xlbl'+z).textContent=t.xlbl;document.getElementById('xnow'+z).textContent=t.xnow;}document.getElementById('wifiTitle').textContent=t.wifiTitle;document.getElementById('lblNewSSID').textContent=t.lblNewSSID;document.getElementById('lblNewPass').textContent=t.lblNewPass;document.getElementById('btnSaveWifi').textContent=t.btnSaveWifi;document.getElementById('wifiNote').textContent=t.wifiNote;document.getElementById('otaMsg').textContent=t.otaMsg;document.getElementById('rstMsg').textContent=t.rstMsg;document.getElementById('peakMsg').textContent=t.peakMsg;document.getElementById('footer').textContent=fmt(t.footer,{version:FW_VER});document.getElementById('fwVersion').textContent=FW_VER;}
+function setLang(l){LG=l;localStorage.setItem('lang',l);const t=TR[l];document.getElementById('langSel').value=l;document.getElementById('z1title').innerHTML=t.z1title;document.getElementById('z2title').innerHTML=t.z2title;document.getElementById('lblAllZones').textContent=t.lblAllZones;document.getElementById('btnAllAuto').textContent=t.btnAllAuto;document.getElementById('btnAllMan').textContent=t.btnAllMan;document.getElementById('btnUpdates').innerHTML='<span class="btn-ico">⬇️</span><span>'+t.btnUpdates+'</span>';document.getElementById('btnOTA').innerHTML='<span class="btn-ico">📦</span><span>'+t.btnOTA+'</span>';document.getElementById('btnWifi').innerHTML='<span class="btn-ico">📶</span><span>'+t.btnWifi+'</span>';document.getElementById('btnRestart').innerHTML='<span class="btn-ico">🔄</span><span>'+t.btnRestart+'</span>';document.getElementById('btnResetPeak').innerHTML='<span class="btn-ico">🌡️</span><span>'+t.btnResetPeak+'</span>';document.getElementById('lblNetSsid').textContent=netText('ssid');document.getElementById('lblNetIp').textContent=netText('ip');document.getElementById('lblNetSignal').textContent=netText('signal');document.getElementById('lblNetTime').textContent=netText('time');for(const z of['1','2']){document.getElementById('lblTemp'+z).textContent=t.lblTemp;document.getElementById('lblMode'+z).textContent=t.lblMode;document.getElementById('lblAuto'+z).textContent=t.lblAuto;document.getElementById('lblTHigh'+z).textContent=t.lblTHigh;document.getElementById('lblHyst'+z).textContent=t.lblHyst;document.getElementById('lblPeakT'+z).textContent=t.lblPeakT;document.getElementById('lblManual'+z).textContent=t.lblManual;document.getElementById('btnSaveZ'+z).textContent=t.btnSaveZ+z;document.getElementById('z'+z+'on').textContent=t.btnOn;document.getElementById('z'+z+'off').textContent=t.btnOff;document.getElementById('xlbl'+z).textContent=t.xlbl;document.getElementById('xnow'+z).textContent=t.xnow;}document.getElementById('otaMsg').textContent=t.otaMsg;document.getElementById('rstMsg').textContent=t.rstMsg;document.getElementById('peakMsg').textContent=t.peakMsg;document.getElementById('footer').textContent=fmt(t.footer,{version:FW_VER});document.getElementById('fwVersion').textContent=FW_VER;}
+function formatNetDatePart(epoch, kind){if(!epoch)return netText('noTime');const loc=LG==='es'?'es-ES':'en-GB';const d=new Date(epoch*1000);if(kind==='day'){const text=d.toLocaleDateString(loc,{weekday:'long'});return text.charAt(0).toUpperCase()+text.slice(1);}if(kind==='date'){return d.toLocaleDateString(loc,{day:'2-digit',month:'2-digit',year:'numeric'});}return d.toLocaleTimeString(loc,{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+function formatSignal(rssi){if(typeof rssi!=='number'||rssi<=-126)return netText('noSignal');const quality=Math.max(0,Math.min(100,Math.round(2*(rssi+100))));return rssi+' dBm · '+quality+'%';}
+function setSensorAlert(d){const el=document.getElementById('sensorAlert');if(!el)return;const t=TR[LG];const sc=parseInt(d.sc)||0;const s1ok=!!d.s1ok;const s2ok=!!d.s2ok;let msg='';if(sc===0){msg=t.sensAlertNone;}else if(!s1ok||!s2ok){const missing=[];if(!s1ok)missing.push(t.sensAlertZ1);if(!s2ok)missing.push(t.sensAlertZ2);msg=t.sensAlertMissing+' '+missing.join(' ');}el.innerHTML=msg?'<strong>DS18B20:</strong> '+msg:'';el.classList.toggle('show',!!msg);}
 function showOTA(){document.getElementById('otaOverlay').classList.add('show');}function hideOTA(){document.getElementById('otaOverlay').classList.remove('show');}function confirmRestart(){document.getElementById('rstOverlay').classList.add('show');}function hideRst(){document.getElementById('rstOverlay').classList.remove('show');}function confirmResetPeak(){document.getElementById('peakOverlay').classList.add('show');}function hidePeakRst(){document.getElementById('peakOverlay').classList.remove('show');}
 async function doResetPeak(){hidePeakRst();try{await fetch('/resetpeaks');}catch(e){}maxTemp={'1':null,'2':null};document.getElementById('mx1').textContent='--.-\u00b0C';document.getElementById('mx2').textContent='--.-\u00b0C';}
-async function doRestart(){hideRst();try{await fetch('/restart');}catch(e){}setTimeout(()=>location.reload(),6000);}function toggleWifiPanel(){const p=document.getElementById('wifiPanel');p.style.display=p.style.display==='block'?'none':'block';}
+async function doRestart(){hideRst();try{await fetch('/restart');}catch(e){}setTimeout(()=>location.reload(),6000);}function openWifiPage(){window.location='/wifi';}
 async function checkForUpdates(manual){const t=TR[LG];try{const res=await fetch('https://api.github.com/repos/'+FW_REPO+'/releases/latest',{headers:{'Accept':'application/vnd.github+json'}});if(!res.ok)throw new Error('github');const rel=await res.json();const latest=rel.tag_name||rel.name||'';if(cmpVer(latest,FW_VER)<=0){if(manual)alert(t.upToDate+' ('+FW_VER+')');if(updateDismissedVersion&&cmpVer(updateDismissedVersion,latest)<=0){updateDismissedVersion='';localStorage.removeItem('updateDismissedVersion');}return;}if(!manual&&updateDismissedVersion&&normVer(updateDismissedVersion)===normVer(latest)){return;}const asset=(rel.assets||[]).find(a=>String(a.name||'').toLowerCase().endsWith('.bin'));const openUrl=asset&&asset.browser_download_url?asset.browser_download_url:rel.html_url;if(!asset&&manual)alert(t.updateOpenRelease);if(confirm(fmt(t.updateAvail,{latest:latest,current:FW_VER}))){window.open(openUrl,'_blank','noopener');updateDismissedVersion='';localStorage.removeItem('updateDismissedVersion');}else if(!manual){updateDismissedVersion=latest;localStorage.setItem('updateDismissedVersion',latest);}}catch(e){if(manual)alert(t.updateError);}}
-async function saveWifi(){const s=document.getElementById('newSSID').value.trim();const p=document.getElementById('newPass').value;if(!s){alert(LG==='es'?'Introduce el SSID':'Enter SSID');return;}const r=await fetch('/savewifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)+'&noreset=1'});if(r.ok)alert(LG==='es'?'WiFi guardado. Reiniciando...':'WiFi saved. Restarting...');else alert('Error');}
 let histData={t1:[],t2:[]};let maxTemp={'1':null,'2':null};
 function drawChart(id,data,col){const cv=document.getElementById(id);if(!cv||!data||data.length<2)return;const W=cv.parentElement.clientWidth||260;const H=cv.parentElement.clientHeight||80;cv.width=W;cv.height=H;const ctx=cv.getContext('2d');ctx.clearRect(0,0,W,H);const N=data.length;const loV=Math.min(...data),hiV=Math.max(...data);const lo=Math.max(0,loV-5),hi=hiV+5,rng=hi-lo||1;const pH=12,pB=12;const toX=i=>(i/(N-1))*(W-2)+1;const toY=v=>H-pB-((v-lo)/rng)*(H-pH-pB);ctx.fillStyle='#0f172a';ctx.fillRect(0,0,W,H);for(let g=1;g<4;g++){const yg=H-pB-(g/3)*(H-pH-pB);ctx.strokeStyle='#1e3050';ctx.beginPath();ctx.moveTo(0,yg);ctx.lineTo(W,yg);ctx.stroke();ctx.fillStyle='#4b5563';ctx.font='8px monospace';ctx.fillText((lo+g/3*rng).toFixed(0)+'\u00b0',3,yg-2);}const grad=ctx.createLinearGradient(0,0,0,H);grad.addColorStop(0,col+'55');grad.addColorStop(1,col+'08');ctx.beginPath();data.forEach((v,i)=>{const y=toY(v);i===0?ctx.moveTo(toX(i),y):ctx.lineTo(toX(i),y);});ctx.lineTo(toX(N-1),H);ctx.lineTo(toX(0),H);ctx.closePath();ctx.fillStyle=grad;ctx.fill();ctx.beginPath();data.forEach((v,i)=>{const y=toY(v);i===0?ctx.moveTo(toX(i),y):ctx.lineTo(toX(i),y);});ctx.strokeStyle=col;ctx.lineWidth=2;ctx.lineJoin='round';ctx.stroke();const lx=toX(N-1),ly=toY(data[N-1]);ctx.beginPath();ctx.arc(lx,ly,3,0,Math.PI*2);ctx.fillStyle=col;ctx.fill();}
 async function fetchHistory(){try{const d=await(await fetch('/history')).json();histData=d;[['1','#38bdf8'],['2','#fb923c']].forEach(([z,c])=>{const arr=d['t'+z]||[];drawChart('ch'+z,arr,c);if(arr.length>0){const m=Math.max(...arr);if(maxTemp[z]===null||m>maxTemp[z])maxTemp[z]=m;const el=document.getElementById('mx'+z);if(el)el.textContent=maxTemp[z].toFixed(1)+'\u00b0C';}});}catch(e){}}
@@ -517,7 +651,7 @@ function setZoneUI(z,autoMode,manualOn){const b=document.getElementById('zmdg'+z
 async function toggleZoneMode(z){const cur=document.getElementById('zmdg'+z).textContent===TR[LG].modeAuto;await fetch('/setmode?zone='+z+'&mode='+(cur?'manual':'auto'));refresh();}
 async function setAllMode(m){await fetch('/setmode?mode='+m);refresh();}
 async function setManual(z,on){await fetch('/setmanual?zone='+z+'&on='+on);refresh();}
-async function refresh(){try{const d=await(await fetch('/status')).json();if(d.ver){FW_VER='v'+normVer(d.ver);if(updateDismissedVersion&&cmpVer(updateDismissedVersion,FW_VER)<=0){updateDismissedVersion='';localStorage.removeItem('updateDismissedVersion');}}if(d.repo){FW_REPO=d.repo;}for(const z of['1','2']){const tv=parseFloat(d['t'+z]).toFixed(1);const te=document.getElementById('t'+z);te.textContent=tv+'\u00b0C';te.className='sv '+tc(parseFloat(tv));setFanState(z,d['on'+z]);}sf('z1th',d.z1th);sf('z1hy',d.z1hy);sf('z2th',d.z2th);sf('z2hy',d.z2hy);setZoneUI('1',d.z1auto,d.z1man);setZoneUI('2',d.z2auto,d.z2man);const sc=parseInt(d.sc)||0;const t=TR[LG];document.getElementById('fwVersion').textContent=FW_VER;document.getElementById('footer').textContent=fmt(t.footer,{version:FW_VER});for(let z=1;z<=2;z++){const el=document.getElementById('sensInfo'+z);if(!el)continue;if(sc===0){el.textContent='🌡️ '+t.sensNone;}else if(sc===1){el.innerHTML='🌡️ '+t.sens1+' &bull; '+(z===1?t.sensZ1:t.sensShared);}else{el.innerHTML='🌡️ '+t.sens1+(z===2?' #2':' #1')+' &bull; '+(z===1?t.sensZ1:t.sensZ2);}}for(const z of['1','2']){const pk=parseFloat(d['mx'+z]);if(!isNaN(pk)&&pk>-100){if(maxTemp[z]===null||pk>maxTemp[z])maxTemp[z]=pk;const el=document.getElementById('mx'+z);if(el)el.textContent=maxTemp[z].toFixed(1)+'\u00b0C';}}if(!updatePrompted&&FW_REPO){updatePrompted=true;setTimeout(()=>checkForUpdates(false),1200);}}catch(e){}}
+async function refresh(){try{const d=await(await fetch('/status')).json();if(d.ver){FW_VER='v'+normVer(d.ver);if(updateDismissedVersion&&cmpVer(updateDismissedVersion,FW_VER)<=0){updateDismissedVersion='';localStorage.removeItem('updateDismissedVersion');}}if(d.repo){FW_REPO=d.repo;}document.getElementById('netSsid').textContent=d.ssid||netText('noWifi');document.getElementById('netIp').textContent=d.ip||'--';document.getElementById('netSignal').textContent=formatSignal(Number(d.rssi));document.getElementById('netTime').textContent=formatNetDatePart(parseInt(d.epoch)||0,'time');setSensorAlert(d);for(const z of['1','2']){const ok=!!d['s'+z+'ok'];const te=document.getElementById('t'+z);if(ok){const tv=parseFloat(d['t'+z]).toFixed(1);te.textContent=tv+'\u00b0C';te.className='sv '+tc(parseFloat(tv));}else{te.textContent='--.-\u00b0C';te.className='sv state';}setFanState(z,d['on'+z]);}sf('z1th',d.z1th);sf('z1hy',d.z1hy);sf('z2th',d.z2th);sf('z2hy',d.z2hy);setZoneUI('1',d.z1auto,d.z1man);setZoneUI('2',d.z2auto,d.z2man);const sc=parseInt(d.sc)||0;const t=TR[LG];document.getElementById('fwVersion').textContent=FW_VER;document.getElementById('footer').textContent=fmt(t.footer,{version:FW_VER});for(let z=1;z<=2;z++){const el=document.getElementById('sensInfo'+z);if(!el)continue;if(sc===0){el.textContent='🌡️ '+t.sensNone;}else if(sc===1){el.innerHTML='🌡️ '+t.sens1+' &bull; '+(z===1?t.sensZ1:t.sensShared);}else{el.innerHTML='🌡️ '+t.sens1+(z===2?' #2':' #1')+' &bull; '+(z===1?t.sensZ1:t.sensZ2);}}for(const z of['1','2']){const pk=parseFloat(d['mx'+z]);if(!isNaN(pk)&&pk>-100){if(maxTemp[z]===null||pk>maxTemp[z])maxTemp[z]=pk;const el=document.getElementById('mx'+z);if(el)el.textContent=maxTemp[z].toFixed(1)+'\u00b0C';}}if(!updatePrompted&&FW_REPO){updatePrompted=true;setTimeout(()=>checkForUpdates(false),1200);}}catch(e){}}
 async function saveZone(e,z){e.preventDefault();const p=new URLSearchParams({zone:z,thigh:document.getElementById('z'+z+'th').value,hyst:document.getElementById('z'+z+'hy').value});const r=await fetch('/set?'+p);if(!r.ok){alert('Error');}else{delete D['z'+z+'th'];delete D['z'+z+'hy'];refresh();}}
 window.addEventListener('load',()=>{setLang(LG);fetchHistory();refresh();setInterval(refresh,3000);setInterval(fetchHistory,15000);});
 </script></body></html>
@@ -526,6 +660,29 @@ window.addEventListener('load',()=>{setLang(LG);fetchHistory();refresh();setInte
 // ─── Manejadores web ──────────────────────────────────────────────────────────
 void handleRoot()   { server.send_P(200, "text/html", HTML_PAGE); }
 void handleStatus() { server.send(200, F("application/json"), buildJson()); }
+void handleWifiPage() { server.send_P(200, "text/html", WIFI_PAGE); }
+
+void handleWifiScan() {
+  const int n = WiFi.scanNetworks(false, true);
+  String j;
+  j.reserve(64 + (n > 0 ? n * 96 : 0));
+  j += F("{\"nets\":[");
+  bool first = true;
+  for (int i = 0; i < n; ++i) {
+    const String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) continue;
+    if (!first) j += ',';
+    first = false;
+    j += F("{\"ssid\":\""); j += jsonEscape(ssid); j += F("\"");
+    j += F(",\"rssi\":"); j += String(WiFi.RSSI(i));
+    j += F(",\"secure\":"); j += WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? F("false") : F("true");
+    j += F(",\"channel\":"); j += String(WiFi.channel(i));
+    j += F("}");
+  }
+  j += F("]}");
+  WiFi.scanDelete();
+  server.send(200, F("application/json"), j);
+}
 
 void handleHistory() {
     String j; j.reserve(700);
@@ -642,8 +799,10 @@ void setup() {
     sensors.begin();
     const int found = sensors.getDeviceCount();
     Serial.printf("DS18B20: %d sensor(es)\n", found);
+    sensor1Valid = (found >= 1);
+    sensor2Valid = (found >= 1);
     if (found >= 1) { sensors.getAddress(addr1, 0); sensors.setResolution(addr1, 11); }
-    if (found >= 2) { sensors.getAddress(addr2, 1); sensors.setResolution(addr2, 11); twoSensors = true; }
+    if (found >= 2) { sensors.getAddress(addr2, 1); sensors.setResolution(addr2, 11); twoSensors = true; sensor2Valid = true; }
     else Serial.println(F("AVISO: zona 2 usara la misma lectura que zona 1"));
 
     // Credenciales WiFi
@@ -654,12 +813,15 @@ void setup() {
       // ── MODO AP ──────────────────────────────────────────────────────────
       apMode = true;
       Serial.println(F("Sin credenciales WiFi → modo AP 'SnapFan-Setup'"));
-      WiFi.mode(WIFI_AP);
+      WiFi.mode(WIFI_AP_STA);
       WiFi.softAP("SnapFan-Setup");
       delay(1000); // Esperar a que la IP esté lista
       Serial.print(F("IP AP: ")); Serial.println(WiFi.softAPIP());
       dnsServer.start(53, "*", WiFi.softAPIP());
       server.on("/", HTTP_GET,  []() { server.send_P(200, "text/html", AP_PAGE); });
+      server.on("/wifi", HTTP_GET, handleWifiPage);
+      server.on("/wifi/scan", HTTP_GET, handleWifiScan);
+      server.on("/status", HTTP_GET, handleStatus);
       server.on("/savewifi", HTTP_POST, handleSaveWifi);
       server.onNotFound([]() {
         server.sendHeader("Location", "http://192.168.4.1/", true);
@@ -671,6 +833,7 @@ void setup() {
       // ── MODO NORMAL ──────────────────────────────────────────────────────
       Serial.printf("Conectando a '%s'\n", wifiSSID);
       WiFi.mode(WIFI_STA);
+      WiFi.setHostname(DEVICE_HOSTNAME);
       WiFi.begin(wifiSSID, wifiPass);
       const unsigned long wStart = millis();
       while (WiFi.status() != WL_CONNECTED && (millis() - wStart) < 15000UL) {
@@ -683,6 +846,8 @@ void setup() {
         Serial.println(F("WiFi no disponible. Reintentando en loop..."));
       }
       server.on("/",         HTTP_GET, handleRoot);
+      server.on("/wifi",     HTTP_GET, handleWifiPage);
+      server.on("/wifi/scan", HTTP_GET, handleWifiScan);
       server.on("/status",   HTTP_GET, handleStatus);
       server.on("/history",  HTTP_GET, handleHistory);
       server.on("/set",      HTTP_GET, handleSet);
@@ -707,8 +872,37 @@ void setup() {
     }
 }
 
+  void updateTemperatures() {
+    if (millis() - lastTempMs < TEMP_MS) return;
+    lastTempMs = millis();
+
+    sensors.requestTemperatures();
+    const float r1 = twoSensors ? sensors.getTempC(addr1) : sensors.getTempCByIndex(0);
+    sensor1Valid = (r1 != DEVICE_DISCONNECTED_C);
+    if (sensor1Valid) temp1 = r1;
+
+    const float r2 = twoSensors ? sensors.getTempC(addr2) : temp1;
+    sensor2Valid = twoSensors ? (r2 != DEVICE_DISCONNECTED_C) : sensor1Valid;
+    if (sensor2Valid) temp2 = r2;
+
+    hist1[histIdx] = temp1;
+    hist2[histIdx] = temp2;
+    histIdx = (histIdx + 1) % HIST_SIZE;
+    if (histCount < HIST_SIZE) histCount++;
+
+    bool pkChanged = false;
+    if (temp1 > peakTemp1) { peakTemp1 = temp1; pkChanged = true; }
+    if (temp2 > peakTemp2) { peakTemp2 = temp2; pkChanged = true; }
+    if (pkChanged) savePeakTemps();
+
+    Serial.printf("Temperaturas -> Z1: %.2f C | Z2: %.2f C\n", temp1, temp2);
+    controlFans();
+  }
+
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
+  updateTemperatures();
+
     if (apMode) {
         dnsServer.processNextRequest();
         server.handleClient();
@@ -737,25 +931,6 @@ void loop() {
     }
 
     server.handleClient();
-
-    if (millis() - lastTempMs >= TEMP_MS) {
-        lastTempMs = millis();
-        sensors.requestTemperatures();
-        const float r1 = twoSensors ? sensors.getTempC(addr1) : sensors.getTempCByIndex(0);
-        if (r1 != DEVICE_DISCONNECTED_C) temp1 = r1;
-        const float r2 = twoSensors ? sensors.getTempC(addr2) : temp1;
-        if (r2 != DEVICE_DISCONNECTED_C) temp2 = r2;
-        // Actualizar historial circular
-        hist1[histIdx] = temp1; hist2[histIdx] = temp2;
-        histIdx = (histIdx + 1) % HIST_SIZE;
-        if (histCount < HIST_SIZE) histCount++;
-        // Actualizar temperaturas máximas persistentes
-        bool pkChanged = false;
-        if (temp1 > peakTemp1) { peakTemp1 = temp1; pkChanged = true; }
-        if (temp2 > peakTemp2) { peakTemp2 = temp2; pkChanged = true; }
-        if (pkChanged) savePeakTemps();
-        controlFans();
-    }
 
     if (MQTT_BROKER[0] != '\0') {
         if (!mqttClient.connected()) mqttReconnect();
