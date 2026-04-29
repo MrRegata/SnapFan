@@ -30,11 +30,18 @@
 #include <WebServer.h>
 #include <HTTPUpdateServer.h>
 #include <DNSServer.h>
+#include <ESPmDNS.h>
+#include <ESP32SSDP.h>
+#include <NetBIOS.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <EEPROM.h>
 #include <PubSubClient.h>
 #include <time.h>
+
+extern "C" {
+#include <esp_netif.h>
+}
 
 #ifndef APP_VERSION
 #define APP_VERSION "0.0.0"
@@ -47,6 +54,7 @@
 const char* FW_VERSION = APP_VERSION;
 const char* FW_GITHUB_REPO = APP_GITHUB_REPO;
 const char* DEVICE_HOSTNAME = "snapfan";
+const char* DEVICE_INSTANCE_NAME = "SnapFan";
 const char* NTP_TZ = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 const char* NTP_SERVER_1 = "pool.ntp.org";
 const char* NTP_SERVER_2 = "time.google.com";
@@ -59,7 +67,7 @@ const char* NTP_SERVER_2 = "time.google.com";
 #define MOSFET2_PIN    6   // GPIO6 salida zona 2
 
 // ─── EEPROM layout ────────────────────────────────────────────────────────────
-#define EEPROM_SIZE      200
+#define EEPROM_SIZE      232
 // Configuración fans (bytes 0–23)
 #define EEPROM_MAGIC     0xC77C6794UL
 #define ADDR_MAGIC        0              // uint32_t
@@ -84,6 +92,14 @@ const char* NTP_SERVER_2 = "time.google.com";
 #define LANG_MAGIC       0x4C414E47UL
 #define ADDR_LANG_MAGIC  174             // uint32_t
 #define ADDR_LANG_CODE   178             // char[3]
+#define SENSOR_MAP_MAGIC 0x53314D50UL
+#define ADDR_SENSOR_MAGIC 184            // uint32_t
+#define ADDR_ZONE1_SENSOR 188            // uint8_t[8]
+#define ADDR_ZONE2_SENSOR 196            // uint8_t[8]
+#define OUTPUT_MAP_MAGIC 0x4F55544DUL
+#define ADDR_OUTPUT_MAGIC 204            // uint32_t
+#define ADDR_ZONE1_OUTPUT 208            // uint8_t
+#define ADDR_ZONE2_OUTPUT 209            // uint8_t
 // Eliminado: solo 2-pin
 
 // ─── MQTT ─────────────────────────────────────────────────────────────────────
@@ -98,6 +114,9 @@ const char* MQTT_CLIENT_ID = "snapfan_esp12";
 // ─── Estado ───────────────────────────────────────────────────────────────────
 bool apMode = false;
 bool timeConfigured = false;
+bool mdnsStarted = false;
+bool nbnsStarted = false;
+bool ssdpStarted = false;
 
 // ─── Parámetros de control ────────────────────────────────────────────────────
 bool  z1Auto = true, z2Auto = true;
@@ -123,6 +142,16 @@ bool  sensor1Valid = false, sensor2Valid = false;
 bool  sensor1Ready = false, sensor2Ready = false;
 char  currentLang[3] = "es";
 
+constexpr int MAX_TEMP_SENSORS = 4;
+DeviceAddress detectedSensorAddrs[MAX_TEMP_SENSORS];
+float detectedSensorTemps[MAX_TEMP_SENSORS];
+bool  detectedSensorValids[MAX_TEMP_SENSORS];
+int   detectedSensorCount = 0;
+DeviceAddress zone1SensorAddr;
+DeviceAddress zone2SensorAddr;
+uint8_t zone1OutputPin = MOSFET1_PIN;
+uint8_t zone2OutputPin = MOSFET2_PIN;
+
 // ─── Historial de temperatura (últimos 60 lecturas ≈ 3 min) ──────────────────
 #define HIST_SIZE 60
 float hist1[HIST_SIZE];
@@ -143,6 +172,10 @@ bool calcAutoFan(float t, float tHigh, float hyst, bool &fanOn) {
   }
   return fanOn;
 }
+
+bool applyWifiHostname();
+void refreshDetectedSensors();
+void loadOutputAssignments();
 
 bool isBootPlaceholderReading(float temperature) {
   return temperature > 84.5f && temperature < 85.5f;
@@ -227,6 +260,169 @@ void savePeakTemps() {
     EEPROM.commit();
 }
 
+void clearDeviceAddress(DeviceAddress address) {
+  memset(address, 0xFF, sizeof(DeviceAddress));
+}
+
+void copyDeviceAddress(DeviceAddress dest, const DeviceAddress src) {
+  memcpy(dest, src, sizeof(DeviceAddress));
+}
+
+bool isDeviceAddressAssigned(const DeviceAddress address) {
+  for (size_t i = 0; i < sizeof(DeviceAddress); ++i) {
+    if (address[i] != 0xFF) return true;
+  }
+  return false;
+}
+
+bool deviceAddressEquals(const DeviceAddress a, const DeviceAddress b) {
+  return memcmp(a, b, sizeof(DeviceAddress)) == 0;
+}
+
+String deviceAddressToString(const DeviceAddress address) {
+  static const char* HEX_DIGITS = "0123456789ABCDEF";
+  char out[17];
+  for (size_t i = 0; i < sizeof(DeviceAddress); ++i) {
+    out[i * 2] = HEX_DIGITS[(address[i] >> 4) & 0x0F];
+    out[i * 2 + 1] = HEX_DIGITS[address[i] & 0x0F];
+  }
+  out[16] = '\0';
+  return String(out);
+}
+
+int hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+bool parseDeviceAddressString(const String& value, DeviceAddress address) {
+  if (value.length() != 16) return false;
+  for (size_t i = 0; i < sizeof(DeviceAddress); ++i) {
+    const int hi = hexNibble(value[i * 2]);
+    const int lo = hexNibble(value[i * 2 + 1]);
+    if (hi < 0 || lo < 0) return false;
+    address[i] = static_cast<uint8_t>((hi << 4) | lo);
+  }
+  return true;
+}
+
+void loadDeviceAddressFromEeprom(int baseAddr, DeviceAddress address) {
+  for (size_t i = 0; i < sizeof(DeviceAddress); ++i) {
+    address[i] = static_cast<uint8_t>(EEPROM.read(baseAddr + static_cast<int>(i)));
+  }
+}
+
+void saveDeviceAddressToEeprom(int baseAddr, const DeviceAddress address) {
+  for (size_t i = 0; i < sizeof(DeviceAddress); ++i) {
+    EEPROM.write(baseAddr + static_cast<int>(i), address[i]);
+  }
+}
+
+void loadSensorAssignments() {
+  uint32_t magic = 0;
+  EEPROM.get(ADDR_SENSOR_MAGIC, magic);
+  if (magic != SENSOR_MAP_MAGIC) {
+    clearDeviceAddress(zone1SensorAddr);
+    clearDeviceAddress(zone2SensorAddr);
+    return;
+  }
+  loadDeviceAddressFromEeprom(ADDR_ZONE1_SENSOR, zone1SensorAddr);
+  loadDeviceAddressFromEeprom(ADDR_ZONE2_SENSOR, zone2SensorAddr);
+}
+
+void saveSensorAssignments() {
+  const uint32_t magic = SENSOR_MAP_MAGIC;
+  EEPROM.put(ADDR_SENSOR_MAGIC, magic);
+  saveDeviceAddressToEeprom(ADDR_ZONE1_SENSOR, zone1SensorAddr);
+  saveDeviceAddressToEeprom(ADDR_ZONE2_SENSOR, zone2SensorAddr);
+  EEPROM.commit();
+}
+
+void resetDetectedSensors() {
+  detectedSensorCount = 0;
+  for (int i = 0; i < MAX_TEMP_SENSORS; ++i) {
+    clearDeviceAddress(detectedSensorAddrs[i]);
+    detectedSensorTemps[i] = DEVICE_DISCONNECTED_C;
+    detectedSensorValids[i] = false;
+  }
+}
+
+void refreshDetectedSensors() {
+  resetDetectedSensors();
+  const int found = sensors.getDeviceCount();
+  int slot = 0;
+  for (int i = 0; i < found && slot < MAX_TEMP_SENSORS; ++i) {
+    DeviceAddress address;
+    if (!sensors.getAddress(address, i)) continue;
+    copyDeviceAddress(detectedSensorAddrs[slot], address);
+    sensors.setResolution(address, 11);
+    ++slot;
+  }
+  detectedSensorCount = slot;
+  twoSensors = detectedSensorCount >= 2;
+}
+
+int findDetectedSensorIndex(const DeviceAddress address) {
+  if (!isDeviceAddressAssigned(address)) return -1;
+  for (int i = 0; i < detectedSensorCount; ++i) {
+    if (deviceAddressEquals(detectedSensorAddrs[i], address)) return i;
+  }
+  return -1;
+}
+
+int firstAvailableSensorIndex(int skipA, int skipB = -1) {
+  for (int i = 0; i < detectedSensorCount; ++i) {
+    if (i != skipA && i != skipB) return i;
+  }
+  return -1;
+}
+
+void resolveZoneSensorIndices(int& zone1Index, int& zone2Index) {
+  zone1Index = findDetectedSensorIndex(zone1SensorAddr);
+  zone2Index = findDetectedSensorIndex(zone2SensorAddr);
+
+  if (zone1Index < 0) zone1Index = firstAvailableSensorIndex(zone2Index);
+  if (zone2Index < 0) {
+    zone2Index = firstAvailableSensorIndex(zone1Index);
+    if (zone2Index < 0 && detectedSensorCount == 1) zone2Index = zone1Index;
+  }
+}
+
+bool isValidFanOutputPin(uint8_t pin) {
+  return pin == MOSFET1_PIN || pin == MOSFET2_PIN;
+}
+
+void loadOutputAssignments() {
+  uint32_t magic = 0;
+  EEPROM.get(ADDR_OUTPUT_MAGIC, magic);
+  if (magic != OUTPUT_MAP_MAGIC) {
+    zone1OutputPin = MOSFET1_PIN;
+    zone2OutputPin = MOSFET2_PIN;
+    return;
+  }
+
+  const uint8_t storedZone1 = static_cast<uint8_t>(EEPROM.read(ADDR_ZONE1_OUTPUT));
+  const uint8_t storedZone2 = static_cast<uint8_t>(EEPROM.read(ADDR_ZONE2_OUTPUT));
+  if (!isValidFanOutputPin(storedZone1) || !isValidFanOutputPin(storedZone2) || storedZone1 == storedZone2) {
+    zone1OutputPin = MOSFET1_PIN;
+    zone2OutputPin = MOSFET2_PIN;
+    return;
+  }
+
+  zone1OutputPin = storedZone1;
+  zone2OutputPin = storedZone2;
+}
+
+void saveOutputAssignments() {
+  const uint32_t magic = OUTPUT_MAP_MAGIC;
+  EEPROM.put(ADDR_OUTPUT_MAGIC, magic);
+  EEPROM.write(ADDR_ZONE1_OUTPUT, zone1OutputPin);
+  EEPROM.write(ADDR_ZONE2_OUTPUT, zone2OutputPin);
+  EEPROM.commit();
+}
+
 // ─── EEPROM – fans ────────────────────────────────────────────────────────────
 void loadSettings() {
     uint32_t magic;
@@ -259,6 +455,113 @@ void saveSettings() {
     EEPROM.commit();
 }
 
+void stopMdnsIfNeeded() {
+  if (mdnsStarted) {
+    MDNS.end();
+    mdnsStarted = false;
+  }
+}
+
+void stopNbnsIfNeeded() {
+  if (nbnsStarted) {
+    NBNS.end();
+    nbnsStarted = false;
+  }
+}
+
+void stopSsdpIfNeeded() {
+  if (ssdpStarted) {
+    SSDP.end();
+    ssdpStarted = false;
+  }
+}
+
+void beginMdnsIfNeeded() {
+  if (WiFi.status() != WL_CONNECTED) {
+    stopMdnsIfNeeded();
+    return;
+  }
+  if (mdnsStarted) return;
+  if (MDNS.begin(DEVICE_HOSTNAME)) {
+    MDNS.setInstanceName(DEVICE_INSTANCE_NAME);
+    MDNS.addService("http", "tcp", 80);
+    MDNS.addServiceTxt("http", "tcp", "device", DEVICE_INSTANCE_NAME);
+    mdnsStarted = true;
+    Serial.printf("mDNS activo: http://%s.local\n", DEVICE_HOSTNAME);
+  } else {
+    Serial.println(F("No se pudo iniciar mDNS"));
+  }
+}
+
+void beginNbnsIfNeeded() {
+  if (WiFi.status() != WL_CONNECTED) {
+    stopNbnsIfNeeded();
+    return;
+  }
+  if (nbnsStarted) return;
+  if (NBNS.begin(DEVICE_HOSTNAME)) {
+    nbnsStarted = true;
+    Serial.printf("NetBIOS activo: %s\n", DEVICE_HOSTNAME);
+  } else {
+    Serial.println(F("No se pudo iniciar NetBIOS"));
+  }
+}
+
+String getDeviceSerialNumber() {
+  const uint64_t chipId = ESP.getEfuseMac();
+  char serial[13];
+  snprintf(serial, sizeof(serial), "%012llX", chipId & 0xFFFFFFFFFFFFULL);
+  return String(serial);
+}
+
+void beginSsdpIfNeeded() {
+  if (WiFi.status() != WL_CONNECTED || WiFi.getMode() != WIFI_STA) {
+    stopSsdpIfNeeded();
+    return;
+  }
+  if (ssdpStarted) return;
+
+  SSDP.setSchemaURL("description.xml");
+  SSDP.setHTTPPort(80);
+  SSDP.setDeviceType("Basic");
+  SSDP.setName(DEVICE_INSTANCE_NAME);
+  SSDP.setURL("index.html");
+  SSDP.setSerialNumber(getDeviceSerialNumber());
+  SSDP.setModelName("SnapFan");
+  SSDP.setModelDescription("SnapFan WiFi fan controller");
+  SSDP.setModelNumber(FW_VERSION);
+  SSDP.setModelURL("https://github.com/MrRegata/SnapFan");
+  SSDP.setManufacturer("MrRegata");
+  SSDP.setManufacturerURL("https://github.com/MrRegata/SnapFan");
+  SSDP.setServerName("SnapFan/1.0");
+
+  if (SSDP.begin()) {
+    ssdpStarted = true;
+    Serial.println(F("SSDP activo: /description.xml"));
+  } else {
+    Serial.println(F("No se pudo iniciar SSDP"));
+  }
+}
+
+void beginWifiStation(const char* ssid, const char* pass) {
+  stopMdnsIfNeeded();
+  stopNbnsIfNeeded();
+  stopSsdpIfNeeded();
+  WiFi.disconnect();
+  WiFi.mode(WIFI_STA);
+  applyWifiHostname();
+  WiFi.begin(ssid, pass);
+}
+
+bool applyWifiHostname() {
+  bool ok = WiFi.setHostname(DEVICE_HOSTNAME);
+  esp_netif_t* staNetif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (staNetif != nullptr) {
+    ok = esp_netif_set_hostname(staNetif, DEVICE_HOSTNAME) == ESP_OK && ok;
+  }
+  return ok;
+}
+
   String jsonEscape(const String& value) {
     String out;
     out.reserve(value.length() + 8);
@@ -282,7 +585,7 @@ void saveSettings() {
 String buildJson() {
   String j; j.reserve(672);
     const bool wifiConnected = WiFi.status() == WL_CONNECTED;
-    const int sensorCount = sensors.getDeviceCount();
+    const int sensorCount = detectedSensorCount;
     const String wifiSsid = wifiConnected ? WiFi.SSID() : String();
     const String wifiIp = wifiConnected ? WiFi.localIP().toString() : String();
     const String wifiHost = wifiConnected ? String(WiFi.getHostname()) : String(DEVICE_HOSTNAME);
@@ -357,8 +660,8 @@ void controlFans() {
       fan2Active = z2ManualOn;
     }
 
-    digitalWrite(MOSFET1_PIN, fan1Active ? HIGH : LOW);
-    digitalWrite(MOSFET2_PIN, fan2Active ? HIGH : LOW);
+    digitalWrite(zone1OutputPin, fan1Active ? HIGH : LOW);
+    digitalWrite(zone2OutputPin, fan2Active ? HIGH : LOW);
 
     static unsigned long ledMs = 0; static bool ledSt = false;
     if (z1Auto || z2Auto) {
@@ -383,6 +686,19 @@ label{font-size:.78rem;color:#94a3b8;display:block;margin-bottom:4px;margin-top:
 input{width:100%;padding:9px 10px;border-radius:8px;border:1px solid #2d3a52;background:#0f172a;color:#e2e8f0;font-size:.9rem}
 button{width:100%;margin-top:18px;padding:11px;background:#3b82f6;color:#fff;border:none;border-radius:8px;font-size:.95rem;cursor:pointer;font-weight:600}
 button:hover{background:#2563eb}
+.scan-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:4px}
+.scan-head label{margin-top:0;margin-bottom:0}
+.scan-btn{margin-top:0;width:auto;padding:8px 12px;font-size:.8rem;background:#1d4ed8;flex:0 0 auto}
+.scan-btn:hover{background:#2563eb}
+.scan-msg,.manual-hint{font-size:.7rem;color:#64748b;margin-top:8px;line-height:1.35}
+.scan-list{margin-top:10px;display:flex;flex-direction:column;gap:8px;max-height:180px;overflow:auto}
+.scan-item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-radius:10px;border:1px solid #2d3a52;background:#0f172a;cursor:pointer;transition:border-color .2s,background .2s}
+.scan-item:hover{border-color:#3b82f6;background:#13203a}
+.scan-item.sel{border-color:#60a5fa;background:#10284a}
+.scan-main{display:flex;flex-direction:column;gap:2px;min-width:0}
+.scan-ssid{font-size:.84rem;color:#e2e8f0;word-break:break-all}
+.scan-meta{font-size:.68rem;color:#94a3b8}
+.scan-lock{font-size:.82rem;color:#60a5fa;white-space:nowrap}
 .note{font-size:.68rem;color:#475569;text-align:center;margin-top:14px;line-height:1.4}
 </style></head><body>
 <div class="box">
@@ -402,8 +718,15 @@ button:hover{background:#2563eb}
   </div>
   <div class="sub">Conectado al punto de acceso de configuraci&oacute;n</div>
   <form method="POST" action="/savewifi">
+    <div class="scan-head">
+      <label id="apScanLbl">Redes WiFi detectadas</label>
+      <button type="button" class="scan-btn" id="apScanBtn" onclick="scanWifi()">Escanear</button>
+    </div>
+    <div class="scan-msg" id="apScanMsg">Pulsa en una red para usar su SSID o escr&iacute;bela manualmente debajo.</div>
+    <div class="scan-list" id="apScanList"></div>
     <label id="apLblSsid">Red WiFi (SSID)</label>
     <input type="text" id="apSsidInput" name="ssid" maxlength="32" required autocomplete="off" placeholder="Nombre de tu red WiFi">
+    <div class="manual-hint" id="apManualHint">Puedes escribir la SSID manualmente si tu red no aparece en el escaneo.</div>
     <label id="apLblPass">Contrase&ntilde;a</label>
     <input type="password" id="apPassInput" name="pass" maxlength="64" autocomplete="off" placeholder="Dejar vac&iacute;o si la red es abierta">
     <button type="submit" id="apSaveBtn">&#128274; Guardar y Conectar</button>
@@ -411,9 +734,16 @@ button:hover{background:#2563eb}
   <div class="note" id="apNote">El ESP se reiniciar&aacute; e intentar&aacute; conectar a tu red.<br>Si falla, volver&aacute; a modo AP autom&aacute;ticamente.</div>
 </div>
 <script>
-const AP_TR={es:{title:'SnapFan – Setup',sub:'Conectado al punto de acceso de configuración',ssid:'Red WiFi (SSID)',ssidPh:'Nombre de tu red WiFi',pass:'Contraseña',passPh:'Dejar vacío si la red es abierta',save:'🔒 Guardar y Conectar',note:'El ESP se reiniciará e intentará conectar a tu red.<br>Si falla, volverá a modo AP automáticamente.'},en:{title:'SnapFan – Setup',sub:'Connected to the configuration access point',ssid:'WiFi network (SSID)',ssidPh:'Your WiFi network name',pass:'Password',passPh:'Leave empty if the network is open',save:'🔒 Save and Connect',note:'The ESP will restart and try to connect to your network.<br>If it fails, it will return to AP mode automatically.'},fr:{title:'SnapFan – Configuration',sub:'Connecté au point d\'accès de configuration',ssid:'Réseau WiFi (SSID)',ssidPh:'Nom de votre réseau WiFi',pass:'Mot de passe',passPh:'Laisser vide si le réseau est ouvert',save:'🔒 Enregistrer et connecter',note:'L\'ESP redémarrera et essaiera de se connecter à votre réseau.<br>En cas d\'échec, il reviendra automatiquement en mode AP.'},it:{title:'SnapFan – Configurazione',sub:'Connesso al punto di accesso di configurazione',ssid:'Rete WiFi (SSID)',ssidPh:'Nome della tua rete WiFi',pass:'Password',passPh:'Lascia vuoto se la rete è aperta',save:'🔒 Salva e collega',note:'L\'ESP si riavvierà e proverà a collegarsi alla tua rete.<br>Se fallisce, tornerà automaticamente in modalità AP.'},pt:{title:'SnapFan – Configuração',sub:'Ligado ao ponto de acesso de configuração',ssid:'Rede WiFi (SSID)',ssidPh:'Nome da tua rede WiFi',pass:'Palavra-passe',passPh:'Deixa vazio se a rede for aberta',save:'🔒 Guardar e Ligar',note:'O ESP vai reiniciar e tentar ligar-se à tua rede.<br>Se falhar, voltará automaticamente ao modo AP.'},de:{title:'SnapFan – Einrichtung',sub:'Mit dem Konfigurationszugangspunkt verbunden',ssid:'WiFi-Netzwerk (SSID)',ssidPh:'Name Ihres WiFi-Netzwerks',pass:'Passwort',passPh:'Leer lassen, wenn das Netzwerk offen ist',save:'🔒 Speichern und Verbinden',note:'Der ESP startet neu und versucht, sich mit Ihrem Netzwerk zu verbinden.<br>Falls es fehlschlägt, kehrt er automatisch in den AP-Modus zurück.'},zh:{title:'SnapFan – 设置',sub:'已连接到配置接入点',ssid:'WiFi 网络 (SSID)',ssidPh:'你的 WiFi 网络名称',pass:'密码',passPh:'如果网络开放请留空',save:'🔒 保存并连接',note:'ESP 将重启并尝试连接你的网络。<br>如果失败，它会自动返回 AP 模式。'}};
-function apSetLang(lang){const t=AP_TR[lang]||AP_TR.es;document.documentElement.lang=lang;document.querySelector('.hdr h1').textContent=t.title;document.querySelector('.sub').textContent=t.sub;document.getElementById('apLblSsid').textContent=t.ssid;document.getElementById('apSsidInput').placeholder=t.ssidPh;document.getElementById('apLblPass').textContent=t.pass;document.getElementById('apPassInput').placeholder=t.passPh;document.getElementById('apSaveBtn').textContent=t.save;document.getElementById('apNote').innerHTML=t.note;}
-fetch('/status').then(r=>r.json()).then(d=>apSetLang(d.lang||'es')).catch(()=>apSetLang('es'));
+const AP_TR={es:{title:'SnapFan – Setup',sub:'Conectado al punto de acceso de configuración',scanLbl:'Redes WiFi detectadas',scanBtn:'Escanear',scanHint:'Pulsa en una red para usar su SSID o escríbela manualmente debajo.',scanRun:'Escaneando redes WiFi...',scanErr:'No se pudo completar el escaneo.',scanEmpty:'No se encontraron redes visibles.',manualHint:'Puedes escribir la SSID manualmente si tu red no aparece en el escaneo.',ssid:'Red WiFi (SSID)',ssidPh:'Nombre de tu red WiFi',pass:'Contraseña',passPh:'Dejar vacío si la red es abierta',save:'🔒 Guardar y Conectar',note:'El ESP se reiniciará e intentará conectar a tu red.<br>Si falla, volverá a modo AP automáticamente.',open:'Abierta',secured:'Protegida',channel:'Canal'},en:{title:'SnapFan – Setup',sub:'Connected to the configuration access point',scanLbl:'Detected WiFi networks',scanBtn:'Scan',scanHint:'Tap a network to use its SSID or type it manually below.',scanRun:'Scanning WiFi networks...',scanErr:'The scan could not be completed.',scanEmpty:'No visible networks were found.',manualHint:'You can type the SSID manually if your network does not appear in the scan.',ssid:'WiFi network (SSID)',ssidPh:'Your WiFi network name',pass:'Password',passPh:'Leave empty if the network is open',save:'🔒 Save and Connect',note:'The ESP will restart and try to connect to your network.<br>If it fails, it will return to AP mode automatically.',open:'Open',secured:'Secured',channel:'Channel'},fr:{title:'SnapFan – Configuration',sub:'Connecté au point d\'accès de configuration',scanLbl:'Réseaux WiFi détectés',scanBtn:'Scanner',scanHint:'Touchez un réseau pour utiliser son SSID ou saisissez-le manuellement ci-dessous.',scanRun:'Recherche des réseaux WiFi...',scanErr:'Le scan n\'a pas pu être terminé.',scanEmpty:'Aucun réseau visible trouvé.',manualHint:'Vous pouvez saisir le SSID manuellement si votre réseau n\'apparaît pas dans le scan.',ssid:'Réseau WiFi (SSID)',ssidPh:'Nom de votre réseau WiFi',pass:'Mot de passe',passPh:'Laisser vide si le réseau est ouvert',save:'🔒 Enregistrer et connecter',note:'L\'ESP redémarrera et essaiera de se connecter à votre réseau.<br>En cas d\'échec, il reviendra automatiquement en mode AP.',open:'Ouvert',secured:'Protégé',channel:'Canal'},it:{title:'SnapFan – Configurazione',sub:'Connesso al punto di accesso di configurazione',scanLbl:'Reti WiFi rilevate',scanBtn:'Scansiona',scanHint:'Seleziona una rete per usare il suo SSID oppure inseriscilo manualmente qui sotto.',scanRun:'Scansione delle reti WiFi...',scanErr:'Impossibile completare la scansione.',scanEmpty:'Nessuna rete visibile trovata.',manualHint:'Puoi inserire l\'SSID manualmente se la tua rete non appare nella scansione.',ssid:'Rete WiFi (SSID)',ssidPh:'Nome della tua rete WiFi',pass:'Password',passPh:'Lascia vuoto se la rete è aperta',save:'🔒 Salva e collega',note:'L\'ESP si riavvierà e proverà a collegarsi alla tua rete.<br>Se fallisce, tornerà automaticamente in modalità AP.',open:'Aperta',secured:'Protetta',channel:'Canale'},pt:{title:'SnapFan – Configuração',sub:'Ligado ao ponto de acesso de configuração',scanLbl:'Redes WiFi detetadas',scanBtn:'Pesquisar',scanHint:'Escolhe uma rede para usar o respetivo SSID ou escreve-o manualmente abaixo.',scanRun:'A procurar redes WiFi...',scanErr:'Não foi possível concluir a pesquisa.',scanEmpty:'Não foram encontradas redes visíveis.',manualHint:'Podes escrever a SSID manualmente se a tua rede não aparecer na pesquisa.',ssid:'Rede WiFi (SSID)',ssidPh:'Nome da tua rede WiFi',pass:'Palavra-passe',passPh:'Deixa vazio se a rede for aberta',save:'🔒 Guardar e Ligar',note:'O ESP vai reiniciar e tentar ligar-se à tua rede.<br>Se falhar, voltará automaticamente ao modo AP.',open:'Aberta',secured:'Protegida',channel:'Canal'},de:{title:'SnapFan – Einrichtung',sub:'Mit dem Konfigurationszugangspunkt verbunden',scanLbl:'Erkannte WiFi-Netzwerke',scanBtn:'Scannen',scanHint:'Wählen Sie ein Netzwerk aus oder geben Sie die SSID unten manuell ein.',scanRun:'WiFi-Netzwerke werden gescannt...',scanErr:'Der Scan konnte nicht abgeschlossen werden.',scanEmpty:'Keine sichtbaren Netzwerke gefunden.',manualHint:'Sie können die SSID manuell eingeben, wenn Ihr Netzwerk nicht im Scan erscheint.',ssid:'WiFi-Netzwerk (SSID)',ssidPh:'Name Ihres WiFi-Netzwerks',pass:'Passwort',passPh:'Leer lassen, wenn das Netzwerk offen ist',save:'🔒 Speichern und Verbinden',note:'Der ESP startet neu und versucht, sich mit Ihrem Netzwerk zu verbinden.<br>Falls es fehlschlägt, kehrt er automatisch in den AP-Modus zurück.',open:'Offen',secured:'Geschützt',channel:'Kanal'},zh:{title:'SnapFan – 设置',sub:'已连接到配置接入点',scanLbl:'检测到的 WiFi 网络',scanBtn:'扫描',scanHint:'点击一个网络使用其 SSID，或在下方手动输入。',scanRun:'正在扫描 WiFi 网络...',scanErr:'无法完成扫描。',scanEmpty:'未找到可见网络。',manualHint:'如果扫描中没有你的网络，也可以手动输入 SSID。',ssid:'WiFi 网络 (SSID)',ssidPh:'你的 WiFi 网络名称',pass:'密码',passPh:'如果网络开放请留空',save:'🔒 保存并连接',note:'ESP 将重启并尝试连接你的网络。<br>如果失败，它会自动返回 AP 模式。',open:'开放',secured:'受保护',channel:'信道'}};
+let apLang='es';
+let scanResults=[];
+let selectedSsid='';
+function apText(key){const t=AP_TR[apLang]||AP_TR.es;return t[key]||AP_TR.es[key]||key;}
+function renderScanResults(){const list=document.getElementById('apScanList');list.innerHTML='';if(!scanResults.length){document.getElementById('apScanMsg').textContent=apText('scanEmpty');return;}document.getElementById('apScanMsg').textContent=apText('scanHint');scanResults.forEach(net=>{const item=document.createElement('button');item.type='button';item.className='scan-item'+(selectedSsid===net.ssid?' sel':'');item.onclick=()=>selectNetwork(net.ssid);const main=document.createElement('div');main.className='scan-main';const ssid=document.createElement('div');ssid.className='scan-ssid';ssid.textContent=net.ssid;const meta=document.createElement('div');meta.className='scan-meta';meta.textContent=`RSSI ${net.rssi} dBm • ${apText('channel')} ${net.channel}`;main.appendChild(ssid);main.appendChild(meta);const lock=document.createElement('div');lock.className='scan-lock';lock.textContent=net.secure?`🔒 ${apText('secured')}`:`📶 ${apText('open')}`;item.appendChild(main);item.appendChild(lock);list.appendChild(item);});}
+function selectNetwork(ssid){selectedSsid=ssid;document.getElementById('apSsidInput').value=ssid;renderScanResults();document.getElementById('apPassInput').focus();}
+async function scanWifi(){const btn=document.getElementById('apScanBtn');btn.disabled=true;document.getElementById('apScanMsg').textContent=apText('scanRun');try{const res=await fetch('/wifi/scan');if(!res.ok)throw new Error('scan');const data=await res.json();scanResults=(data.nets||[]).filter(net=>net.ssid);const current=document.getElementById('apSsidInput').value.trim();selectedSsid=current && scanResults.some(net=>net.ssid===current)?current:'';renderScanResults();}catch(e){scanResults=[];document.getElementById('apScanList').innerHTML='';document.getElementById('apScanMsg').textContent=apText('scanErr');}finally{btn.disabled=false;}}
+function apSetLang(lang){apLang=AP_TR[lang]?lang:'es';document.documentElement.lang=apLang;document.querySelector('.hdr h1').textContent=apText('title');document.querySelector('.sub').textContent=apText('sub');document.getElementById('apScanLbl').textContent=apText('scanLbl');document.getElementById('apScanBtn').textContent=apText('scanBtn');document.getElementById('apLblSsid').textContent=apText('ssid');document.getElementById('apSsidInput').placeholder=apText('ssidPh');document.getElementById('apManualHint').textContent=apText('manualHint');document.getElementById('apLblPass').textContent=apText('pass');document.getElementById('apPassInput').placeholder=apText('passPh');document.getElementById('apSaveBtn').textContent=apText('save');document.getElementById('apNote').innerHTML=apText('note');renderScanResults();if(!scanResults.length)document.getElementById('apScanMsg').textContent=apText('scanHint');}
+fetch('/status').then(r=>r.json()).then(d=>{apSetLang(d.lang||'es');scanWifi();}).catch(()=>{apSetLang('es');scanWifi();});
 </script></body></html>
 )rawliteral";
 
@@ -548,7 +878,7 @@ body{font-family:'Segoe UI',sans-serif;background:radial-gradient(circle at top,
 .statusgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:14px}.statuscard{background:#0f172a;border:1px solid #253246;border-radius:12px;padding:12px;text-align:center}.statusk{font-size:.7rem;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}.statusv{font-size:.98rem;font-weight:700;color:#e2e8f0;word-break:break-word}
 .content{display:grid;grid-template-columns:1.15fr .85fr;gap:14px}.panel{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:16px}.panel h2{color:#bfdbfe;font-size:.88rem;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px}.scanbar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:12px}.scanmsg{font-size:.8rem;color:#94a3b8}.btn{border:none;border-radius:10px;padding:10px 14px;font-size:.84rem;font-weight:700;cursor:pointer}.btn.blue{background:#2563eb;color:#eff6ff}.btn.blue:hover{background:#1d4ed8}.btn.dark{background:#0f172a;color:#93c5fd;border:1px solid #334155}.btn.dark:hover{background:#162235}
 .nets{display:grid;gap:10px;max-height:460px;overflow:auto;padding-right:4px}.net{background:#0f172a;border:1px solid #253246;border-radius:12px;padding:12px;display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;transition:transform .18s ease,border-color .18s ease,background .18s ease}.net:hover{transform:translateY(-1px);border-color:#60a5fa;background:#142033}.net.sel{border-color:#f59e0b;box-shadow:0 0 0 1px #f59e0b inset}.netname{font-size:.96rem;font-weight:700;color:#eff6ff;margin-bottom:4px;word-break:break-word}.netmeta{font-size:.74rem;color:#94a3b8;display:flex;gap:8px;flex-wrap:wrap}.pill{display:inline-flex;align-items:center;gap:4px;padding:4px 8px;border-radius:999px;background:#182437;border:1px solid #2a3a53;color:#cbd5e1}.sec{background:#052e16;border-color:#14532d;color:#bbf7d0}.open{background:#1f2937;border-color:#374151;color:#d1d5db}
-.formgrid{display:grid;gap:12px}.field label{display:block;font-size:.76rem;color:#94a3b8;margin-bottom:5px}.field input{width:100%;padding:10px 11px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#e2e8f0;font-size:.92rem}.field input:focus{outline:none;border-color:#60a5fa}.note{font-size:.78rem;color:#94a3b8;line-height:1.5}.toast{display:none;margin-top:12px;padding:11px 12px;border-radius:12px;font-size:.84rem}.toast.show{display:block}.toast.ok{background:#052e16;border:1px solid #166534;color:#86efac}.toast.err{background:#450a0a;border:1px solid #991b1b;color:#fca5a5}
+.formgrid{display:grid;gap:12px}.field label{display:block;font-size:.76rem;color:#94a3b8;margin-bottom:5px}.field input{width:100%;padding:10px 11px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#e2e8f0;font-size:.92rem}.field input:focus{outline:none;border-color:#60a5fa}.manualhint{font-size:.76rem;color:#94a3b8;line-height:1.45;margin-top:-4px}.note{font-size:.78rem;color:#94a3b8;line-height:1.5}.toast{display:none;margin-top:12px;padding:11px 12px;border-radius:12px;font-size:.84rem}.toast.show{display:block}.toast.ok{background:#052e16;border:1px solid #166534;color:#86efac}.toast.err{background:#450a0a;border:1px solid #991b1b;color:#fca5a5}
 @media (max-width: 820px){.content{grid-template-columns:1fr}.nets{max-height:none}}
 </style></head><body>
 <div class="shell">
@@ -575,14 +905,15 @@ body{font-family:'Segoe UI',sans-serif;background:radial-gradient(circle at top,
         <h2 id="scanTitle">Redes detectadas</h2>
         <button class="btn dark" id="scanBtn" onclick="scanWifi()">Escanear de nuevo</button>
       </div>
-      <div class="scanmsg" id="scanMsg">Buscando redes WiFi cercanas...</div>
+      <div class="scanmsg" id="scanMsg">Pulsa una red detectada o escribe la SSID manualmente.</div>
       <div class="nets" id="scanList"></div>
     </section>
     <section class="panel">
       <h2 id="formTitle">Conectar a la red</h2>
       <div class="formgrid">
-        <div class="field"><label id="lblSsid" for="ssidInput">SSID</label><input id="ssidInput" maxlength="32" autocomplete="off"></div>
-        <div class="field"><label id="lblPass" for="passInput">Contraseña</label><input id="passInput" type="password" maxlength="64" autocomplete="off"></div>
+        <div class="field"><label id="lblSsid" for="ssidInput">SSID</label><input id="ssidInput" maxlength="32" autocomplete="off" placeholder="Nombre de tu red WiFi"></div>
+        <p class="manualhint" id="manualHint">Si tu red no aparece, puedes escribir la SSID manualmente y seguir guardando igual.</p>
+        <div class="field"><label id="lblPass" for="passInput">Contraseña</label><input id="passInput" type="password" maxlength="64" autocomplete="off" placeholder="Dejar vacío si la red es abierta"></div>
         <button class="btn blue" id="saveBtn" onclick="saveWifi()">Guardar y reconectar</button>
         <p class="note" id="wifiNote">Si la red es abierta, deja la contraseña vacía. Al guardar, el ESP32-C3 reiniciará e intentará enlazar con esa red.</p>
         <div class="toast" id="toast"></div>
@@ -591,7 +922,7 @@ body{font-family:'Segoe UI',sans-serif;background:radial-gradient(circle at top,
   </div>
 </div>
 <script>
-const TR={es:{back:'\u2190 Volver al panel',eyebrow:'Administrador WiFi',title:'Conecta SnapFan a otra red',hero:'Pulsa en una red detectada para rellenar el SSID, introduce la contraseña si hace falta y guarda. El equipo reiniciará para conectarse.',ssidNow:'SSID actual',ipNow:'IP actual',signal:'Señal',host:'Host',clock:'Hora',sync:'NTP',scanTitle:'Redes detectadas',scanBtn:'Escanear de nuevo',scanIdle:'Selecciona una red o lanza un nuevo escaneo.',scanRun:'Buscando redes WiFi cercanas...',scanNone:'No se han encontrado redes visibles.',scanErr:'No se pudo escanear ahora mismo.',formTitle:'Conectar a la red',lblSsid:'SSID',lblPass:'Contraseña',save:'Guardar y reconectar',note:'Si la red es abierta, deja la contraseña vacía. Al guardar, el ESP32-C3 reiniciará e intentará enlazar con esa red.',selectHint:'Red seleccionada',open:'Abierta',secure:'Protegida',saved:'WiFi guardado. Reiniciando...',saveErr:'No se pudo guardar la nueva WiFi.',ssidReq:'Introduce el SSID',noWifi:'Sin WiFi',noTime:'Sin hora',synced:'Sincronizada',unsynced:'Pendiente',dayClock:'Hora local'},en:{back:'\u2190 Back to dashboard',eyebrow:'WiFi manager',title:'Connect SnapFan to another network',hero:'Tap a detected network to fill the SSID, enter the password if needed, and save. The device will reboot and reconnect.',ssidNow:'Current SSID',ipNow:'Current IP',signal:'Signal',host:'Host',clock:'Time',sync:'NTP',scanTitle:'Detected networks',scanBtn:'Scan again',scanIdle:'Select a network or start a new scan.',scanRun:'Scanning nearby WiFi networks...',scanNone:'No visible networks were found.',scanErr:'WiFi scan failed right now.',formTitle:'Connect to network',lblSsid:'SSID',lblPass:'Password',save:'Save and reconnect',note:'If the network is open, leave the password empty. After saving, the ESP32-C3 will reboot and try to join that network.',selectHint:'Selected network',open:'Open',secure:'Secured',saved:'WiFi saved. Restarting...',saveErr:'Could not save the new WiFi.',ssidReq:'Enter SSID',noWifi:'No WiFi',noTime:'No time',synced:'Synced',unsynced:'Pending',dayClock:'Local time'},fr:{back:'\u2190 Retour au tableau de bord',eyebrow:'Gestionnaire WiFi',title:'Connecter SnapFan à un autre réseau',hero:'Touchez un réseau détecté pour remplir le SSID, saisissez le mot de passe si nécessaire, puis enregistrez. L\'appareil redémarrera et se reconnectera.',ssidNow:'SSID actuel',ipNow:'IP actuelle',signal:'Signal',host:'Hôte',clock:'Heure',sync:'NTP',scanTitle:'Réseaux détectés',scanBtn:'Relancer le scan',scanIdle:'Sélectionnez un réseau ou lancez un nouveau scan.',scanRun:'Recherche des réseaux WiFi à proximité...',scanNone:'Aucun réseau visible trouvé.',scanErr:'Impossible de lancer le scan WiFi pour le moment.',formTitle:'Se connecter au réseau',lblSsid:'SSID',lblPass:'Mot de passe',save:'Enregistrer et reconnecter',note:'Si le réseau est ouvert, laissez le mot de passe vide. Après l\'enregistrement, l\'ESP32-C3 redémarrera et essaiera de rejoindre ce réseau.',selectHint:'Réseau sélectionné',open:'Ouvert',secure:'Sécurisé',saved:'WiFi enregistré. Redémarrage...',saveErr:'Impossible d\'enregistrer le nouveau WiFi.',ssidReq:'Saisissez le SSID',noWifi:'Pas de WiFi',noTime:'Pas d\'heure',synced:'Synchronisé',unsynced:'En attente',dayClock:'Heure locale'},it:{back:'\u2190 Torna al pannello',eyebrow:'Gestore WiFi',title:'Collega SnapFan a un\'altra rete',hero:'Tocca una rete rilevata per compilare l\'SSID, inserisci la password se necessaria e salva. Il dispositivo si riavvierà e si ricollegherà.',ssidNow:'SSID attuale',ipNow:'IP attuale',signal:'Segnale',host:'Host',clock:'Ora',sync:'NTP',scanTitle:'Reti rilevate',scanBtn:'Scansiona di nuovo',scanIdle:'Seleziona una rete o avvia una nuova scansione.',scanRun:'Scansione delle reti WiFi vicine...',scanNone:'Nessuna rete visibile trovata.',scanErr:'Impossibile eseguire la scansione WiFi in questo momento.',formTitle:'Connetti alla rete',lblSsid:'SSID',lblPass:'Password',save:'Salva e riconnetti',note:'Se la rete è aperta, lascia vuota la password. Dopo il salvataggio, l\'ESP32-C3 si riavvierà e proverà a collegarsi a quella rete.',selectHint:'Rete selezionata',open:'Aperta',secure:'Protetta',saved:'WiFi salvato. Riavvio...',saveErr:'Impossibile salvare il nuovo WiFi.',ssidReq:'Inserisci l\'SSID',noWifi:'Nessun WiFi',noTime:'Nessuna ora',synced:'Sincronizzato',unsynced:'In attesa',dayClock:'Ora locale'},pt:{back:'\u2190 Voltar ao painel',eyebrow:'Gestor de WiFi',title:'Ligar o SnapFan a outra rede',hero:'Toque numa rede detetada para preencher o SSID, introduza a palavra-passe se necessário e guarde. O dispositivo vai reiniciar e voltar a ligar-se.',ssidNow:'SSID atual',ipNow:'IP atual',signal:'Sinal',host:'Host',clock:'Hora',sync:'NTP',scanTitle:'Redes detetadas',scanBtn:'Pesquisar novamente',scanIdle:'Selecione uma rede ou inicie uma nova pesquisa.',scanRun:'A procurar redes WiFi próximas...',scanNone:'Não foram encontradas redes visíveis.',scanErr:'Não foi possível pesquisar WiFi agora.',formTitle:'Ligar à rede',lblSsid:'SSID',lblPass:'Palavra-passe',save:'Guardar e voltar a ligar',note:'Se a rede estiver aberta, deixe a palavra-passe vazia. Após guardar, o ESP32-C3 vai reiniciar e tentar ligar-se a essa rede.',selectHint:'Rede selecionada',open:'Aberta',secure:'Protegida',saved:'WiFi guardado. A reiniciar...',saveErr:'Não foi possível guardar o novo WiFi.',ssidReq:'Introduza o SSID',noWifi:'Sem WiFi',noTime:'Sem hora',synced:'Sincronizado',unsynced:'Pendente',dayClock:'Hora local'},de:{back:'\u2190 Zurück zum Dashboard',eyebrow:'WiFi-Verwaltung',title:'SnapFan mit einem anderen Netzwerk verbinden',hero:'Wählen Sie ein erkanntes Netzwerk aus, um die SSID zu übernehmen, geben Sie bei Bedarf das Passwort ein und speichern Sie. Das Gerät startet neu und verbindet sich erneut.',ssidNow:'Aktuelle SSID',ipNow:'Aktuelle IP',signal:'Signal',host:'Host',clock:'Uhrzeit',sync:'NTP',scanTitle:'Erkannte Netzwerke',scanBtn:'Erneut scannen',scanIdle:'Wählen Sie ein Netzwerk oder starten Sie einen neuen Scan.',scanRun:'Suche nach verfügbaren WLAN-Netzwerken...',scanNone:'Keine sichtbaren Netzwerke gefunden.',scanErr:'WLAN-Scan konnte gerade nicht ausgeführt werden.',formTitle:'Mit Netzwerk verbinden',lblSsid:'SSID',lblPass:'Passwort',save:'Speichern und neu verbinden',note:'Wenn das Netzwerk offen ist, lassen Sie das Passwort leer. Nach dem Speichern startet der ESP32-C3 neu und versucht, sich mit diesem Netzwerk zu verbinden.',selectHint:'Ausgewähltes Netzwerk',open:'Offen',secure:'Geschützt',saved:'WiFi gespeichert. Neustart...',saveErr:'Das neue WiFi konnte nicht gespeichert werden.',ssidReq:'SSID eingeben',noWifi:'Kein WiFi',noTime:'Keine Uhrzeit',synced:'Synchronisiert',unsynced:'Ausstehend',dayClock:'Ortszeit'},zh:{back:'\u2190 返回面板',eyebrow:'WiFi 管理',title:'将 SnapFan 连接到其他网络',hero:'点击已检测到的网络以填入 SSID，如有需要请输入密码并保存。设备将重启并重新连接。',ssidNow:'当前 SSID',ipNow:'当前 IP',signal:'信号',host:'主机',clock:'时间',sync:'NTP',scanTitle:'检测到的网络',scanBtn:'重新扫描',scanIdle:'请选择一个网络或重新开始扫描。',scanRun:'正在扫描附近的 WiFi 网络...',scanNone:'未找到可见网络。',scanErr:'当前无法执行 WiFi 扫描。',formTitle:'连接到网络',lblSsid:'SSID',lblPass:'密码',save:'保存并重新连接',note:'如果网络是开放的，请将密码留空。保存后，ESP32-C3 将重启并尝试连接该网络。',selectHint:'已选网络',open:'开放',secure:'受保护',saved:'WiFi 已保存，正在重启...',saveErr:'无法保存新的 WiFi。',ssidReq:'请输入 SSID',noWifi:'无 WiFi',noTime:'无时间',synced:'已同步',unsynced:'等待中',dayClock:'本地时间'}};
+const TR={es:{back:'\u2190 Volver al panel',eyebrow:'Administrador WiFi',title:'Conecta SnapFan a otra red',hero:'Pulsa en una red detectada para rellenar el SSID, introduce la contraseña si hace falta y guarda. El equipo reiniciará para conectarse.',ssidNow:'SSID actual',ipNow:'IP actual',signal:'Señal',host:'Host',clock:'Hora',sync:'NTP',scanTitle:'Redes detectadas',scanBtn:'Escanear de nuevo',scanIdle:'Pulsa una red detectada o escribe la SSID manualmente.',scanRun:'Buscando redes WiFi cercanas...',scanNone:'No se han encontrado redes visibles.',scanErr:'No se pudo escanear ahora mismo.',manualHint:'Si tu red no aparece, puedes escribir la SSID manualmente y seguir guardando igual.',formTitle:'Conectar a la red',lblSsid:'SSID',ssidPh:'Nombre de tu red WiFi',lblPass:'Contraseña',passPh:'Dejar vacío si la red es abierta',save:'Guardar y reconectar',note:'Si la red es abierta, deja la contraseña vacía. Al guardar, el ESP32-C3 reiniciará e intentará enlazar con esa red.',selectHint:'Red seleccionada',open:'Abierta',secure:'Protegida',saved:'WiFi guardado. Reiniciando...',saveErr:'No se pudo guardar la nueva WiFi.',ssidReq:'Introduce el SSID',noWifi:'Sin WiFi',noTime:'Sin hora',synced:'Sincronizada',unsynced:'Pendiente',dayClock:'Hora local'},en:{back:'\u2190 Back to dashboard',eyebrow:'WiFi manager',title:'Connect SnapFan to another network',hero:'Tap a detected network to fill the SSID, enter the password if needed, and save. The device will reboot and reconnect.',ssidNow:'Current SSID',ipNow:'Current IP',signal:'Signal',host:'Host',clock:'Time',sync:'NTP',scanTitle:'Detected networks',scanBtn:'Scan again',scanIdle:'Tap a detected network or type the SSID manually.',scanRun:'Scanning nearby WiFi networks...',scanNone:'No visible networks were found.',scanErr:'WiFi scan failed right now.',manualHint:'If your network does not appear, you can type the SSID manually and save anyway.',formTitle:'Connect to network',lblSsid:'SSID',ssidPh:'Your WiFi network name',lblPass:'Password',passPh:'Leave empty if the network is open',save:'Save and reconnect',note:'If the network is open, leave the password empty. After saving, the ESP32-C3 will reboot and try to join that network.',selectHint:'Selected network',open:'Open',secure:'Secured',saved:'WiFi saved. Restarting...',saveErr:'Could not save the new WiFi.',ssidReq:'Enter SSID',noWifi:'No WiFi',noTime:'No time',synced:'Synced',unsynced:'Pending',dayClock:'Local time'},fr:{back:'\u2190 Retour au tableau de bord',eyebrow:'Gestionnaire WiFi',title:'Connecter SnapFan à un autre réseau',hero:'Touchez un réseau détecté pour remplir le SSID, saisissez le mot de passe si nécessaire, puis enregistrez. L\'appareil redémarrera et se reconnectera.',ssidNow:'SSID actuel',ipNow:'IP actuelle',signal:'Signal',host:'Hôte',clock:'Heure',sync:'NTP',scanTitle:'Réseaux détectés',scanBtn:'Relancer le scan',scanIdle:'Touchez un réseau détecté ou saisissez le SSID manuellement.',scanRun:'Recherche des réseaux WiFi à proximité...',scanNone:'Aucun réseau visible trouvé.',scanErr:'Impossible de lancer le scan WiFi pour le moment.',manualHint:'Si votre réseau n\'apparaît pas, vous pouvez saisir le SSID manuellement et enregistrer quand même.',formTitle:'Se connecter au réseau',lblSsid:'SSID',ssidPh:'Nom de votre réseau WiFi',lblPass:'Mot de passe',passPh:'Laisser vide si le réseau est ouvert',save:'Enregistrer et reconnecter',note:'Si le réseau est ouvert, laissez le mot de passe vide. Après l\'enregistrement, l\'ESP32-C3 redémarrera et essaiera de rejoindre ce réseau.',selectHint:'Réseau sélectionné',open:'Ouvert',secure:'Sécurisé',saved:'WiFi enregistré. Redémarrage...',saveErr:'Impossible d\'enregistrer le nouveau WiFi.',ssidReq:'Saisissez le SSID',noWifi:'Pas de WiFi',noTime:'Pas d\'heure',synced:'Synchronisé',unsynced:'En attente',dayClock:'Heure locale'},it:{back:'\u2190 Torna al pannello',eyebrow:'Gestore WiFi',title:'Collega SnapFan a un\'altra rete',hero:'Tocca una rete rilevata per compilare l\'SSID, inserisci la password se necessaria e salva. Il dispositivo si riavvierà e si ricollegherà.',ssidNow:'SSID attuale',ipNow:'IP attuale',signal:'Segnale',host:'Host',clock:'Ora',sync:'NTP',scanTitle:'Reti rilevate',scanBtn:'Scansiona di nuovo',scanIdle:'Seleziona una rete rilevata oppure inserisci manualmente l\'SSID.',scanRun:'Scansione delle reti WiFi vicine...',scanNone:'Nessuna rete visibile trovata.',scanErr:'Impossibile eseguire la scansione WiFi in questo momento.',manualHint:'Se la tua rete non appare, puoi inserire manualmente l\'SSID e salvare comunque.',formTitle:'Connetti alla rete',lblSsid:'SSID',ssidPh:'Nome della tua rete WiFi',lblPass:'Password',passPh:'Lascia vuoto se la rete è aperta',save:'Salva e riconnetti',note:'Se la rete è aperta, lascia vuota la password. Dopo il salvataggio, l\'ESP32-C3 si riavvierà e proverà a collegarsi a quella rete.',selectHint:'Rete selezionata',open:'Aperta',secure:'Protetta',saved:'WiFi salvato. Riavvio...',saveErr:'Impossibile salvare il nuovo WiFi.',ssidReq:'Inserisci l\'SSID',noWifi:'Nessun WiFi',noTime:'Nessuna ora',synced:'Sincronizzato',unsynced:'In attesa',dayClock:'Ora locale'},pt:{back:'\u2190 Voltar ao painel',eyebrow:'Gestor de WiFi',title:'Ligar o SnapFan a outra rede',hero:'Toque numa rede detetada para preencher o SSID, introduza a palavra-passe se necessário e guarde. O dispositivo vai reiniciar e voltar a ligar-se.',ssidNow:'SSID atual',ipNow:'IP atual',signal:'Sinal',host:'Host',clock:'Hora',sync:'NTP',scanTitle:'Redes detetadas',scanBtn:'Pesquisar novamente',scanIdle:'Escolha uma rede detetada ou escreva a SSID manualmente.',scanRun:'A procurar redes WiFi próximas...',scanNone:'Não foram encontradas redes visíveis.',scanErr:'Não foi possível pesquisar WiFi agora.',manualHint:'Se a tua rede não aparecer, podes escrever a SSID manualmente e guardar na mesma.',formTitle:'Ligar à rede',lblSsid:'SSID',ssidPh:'Nome da tua rede WiFi',lblPass:'Palavra-passe',passPh:'Deixa vazio se a rede for aberta',save:'Guardar e voltar a ligar',note:'Se a rede estiver aberta, deixe a palavra-passe vazia. Após guardar, o ESP32-C3 vai reiniciar e tentar ligar-se a essa rede.',selectHint:'Rede selecionada',open:'Aberta',secure:'Protegida',saved:'WiFi guardado. A reiniciar...',saveErr:'Não foi possível guardar o novo WiFi.',ssidReq:'Introduza o SSID',noWifi:'Sem WiFi',noTime:'Sem hora',synced:'Sincronizado',unsynced:'Pendente',dayClock:'Hora local'},de:{back:'\u2190 Zurück zum Dashboard',eyebrow:'WiFi-Verwaltung',title:'SnapFan mit einem anderen Netzwerk verbinden',hero:'Wählen Sie ein erkanntes Netzwerk aus, um die SSID zu übernehmen, geben Sie bei Bedarf das Passwort ein und speichern Sie. Das Gerät startet neu und verbindet sich erneut.',ssidNow:'Aktuelle SSID',ipNow:'Aktuelle IP',signal:'Signal',host:'Host',clock:'Uhrzeit',sync:'NTP',scanTitle:'Erkannte Netzwerke',scanBtn:'Erneut scannen',scanIdle:'Wählen Sie ein erkanntes Netzwerk oder geben Sie die SSID manuell ein.',scanRun:'Suche nach verfügbaren WLAN-Netzwerken...',scanNone:'Keine sichtbaren Netzwerke gefunden.',scanErr:'WLAN-Scan konnte gerade nicht ausgeführt werden.',manualHint:'Wenn Ihr Netzwerk nicht erscheint, können Sie die SSID manuell eingeben und trotzdem speichern.',formTitle:'Mit Netzwerk verbinden',lblSsid:'SSID',ssidPh:'Name Ihres WiFi-Netzwerks',lblPass:'Passwort',passPh:'Leer lassen, wenn das Netzwerk offen ist',save:'Speichern und neu verbinden',note:'Wenn das Netzwerk offen ist, lassen Sie das Passwort leer. Nach dem Speichern startet der ESP32-C3 neu und versucht, sich mit diesem Netzwerk zu verbinden.',selectHint:'Ausgewähltes Netzwerk',open:'Offen',secure:'Geschützt',saved:'WiFi gespeichert. Neustart...',saveErr:'Das neue WiFi konnte nicht gespeichert werden.',ssidReq:'SSID eingeben',noWifi:'Kein WiFi',noTime:'Keine Uhrzeit',synced:'Synchronisiert',unsynced:'Ausstehend',dayClock:'Ortszeit'},zh:{back:'\u2190 返回面板',eyebrow:'WiFi 管理',title:'将 SnapFan 连接到其他网络',hero:'点击已检测到的网络以填入 SSID，如有需要请输入密码并保存。设备将重启并重新连接。',ssidNow:'当前 SSID',ipNow:'当前 IP',signal:'信号',host:'主机',clock:'时间',sync:'NTP',scanTitle:'检测到的网络',scanBtn:'重新扫描',scanIdle:'点击检测到的网络，或手动输入 SSID。',scanRun:'正在扫描附近的 WiFi 网络...',scanNone:'未找到可见网络。',scanErr:'当前无法执行 WiFi 扫描。',manualHint:'如果没有出现你的网络，也可以手动输入 SSID 后继续保存。',formTitle:'连接到网络',lblSsid:'SSID',ssidPh:'你的 WiFi 网络名称',lblPass:'密码',passPh:'如果网络开放请留空',save:'保存并重新连接',note:'如果网络是开放的，请将密码留空。保存后，ESP32-C3 将重启并尝试连接该网络。',selectHint:'已选网络',open:'开放',secure:'受保护',saved:'WiFi 已保存，正在重启...',saveErr:'无法保存新的 WiFi。',ssidReq:'请输入 SSID',noWifi:'无 WiFi',noTime:'无时间',synced:'已同步',unsynced:'等待中',dayClock:'本地时间'}};
 const LOCALE_MAP={es:'es-ES',en:'en-GB',fr:'fr-FR',it:'it-IT',pt:'pt-PT',de:'de-DE',zh:'zh-CN'};
 let LG=TR[localStorage.getItem('lang')]?localStorage.getItem('lang'):'es';
 let scanResults=[];
@@ -603,12 +934,12 @@ function formatSignal(rssi){if(typeof rssi!=='number'||rssi<=-126)return '--';co
 function securityLabel(secure){return secure?t('secure'):t('open');}
 function renderNetworks(){const host=document.getElementById('scanList');host.innerHTML='';if(!scanResults.length){document.getElementById('scanMsg').textContent=t('scanNone');return;}document.getElementById('scanMsg').textContent=t('scanIdle');const selected=document.getElementById('ssidInput').value.trim();scanResults.forEach(net=>{const row=document.createElement('button');row.type='button';row.className='net'+(selected===net.ssid?' sel':'');row.onclick=()=>selectNetwork(net);const left=document.createElement('div');const name=document.createElement('div');name.className='netname';name.textContent=net.ssid||'(hidden)';const meta=document.createElement('div');meta.className='netmeta';meta.innerHTML='<span class="pill">📶 '+formatSignal(net.rssi)+'</span><span class="pill '+(net.secure?'sec':'open')+'">'+securityLabel(net.secure)+'</span><span class="pill">CH '+net.channel+'</span>';left.appendChild(name);left.appendChild(meta);const right=document.createElement('div');right.className='pill';right.textContent=t('selectHint');row.appendChild(left);row.appendChild(right);host.appendChild(row);});}
 function selectNetwork(net){document.getElementById('ssidInput').value=net.ssid||'';document.getElementById('passInput').focus();renderNetworks();clearToast();}
-async function scanWifi(){clearToast();document.getElementById('scanMsg').textContent=t('scanRun');document.getElementById('scanList').innerHTML='';try{const res=await fetch('/wifi/scan');if(!res.ok)throw new Error('scan');const data=await res.json();scanResults=(data.nets||[]).filter(net=>net.ssid);renderNetworks();}catch(e){scanResults=[];renderNetworks();document.getElementById('scanMsg').textContent=t('scanErr');showToast(t('scanErr'),'err');}}
+async function scanWifi(){const btn=document.getElementById('scanBtn');clearToast();btn.disabled=true;document.getElementById('scanMsg').textContent=t('scanRun');document.getElementById('scanList').innerHTML='';try{const res=await fetch('/wifi/scan');if(!res.ok)throw new Error('scan');const data=await res.json();scanResults=(data.nets||[]).filter(net=>net.ssid);renderNetworks();}catch(e){scanResults=[];renderNetworks();document.getElementById('scanMsg').textContent=t('scanErr');showToast(t('scanErr'),'err');}finally{btn.disabled=false;}}
 async function persistLang(lang){try{await fetch('/setlang?lang='+encodeURIComponent(lang));}catch(e){}}
 async function loadStatus(){try{const d=await(await fetch('/status')).json();if(d.lang&&TR[d.lang]&&d.lang!==LG){setLang(d.lang,false,false);}document.getElementById('curSsid').textContent=d.ssid||t('noWifi');document.getElementById('curIp').textContent=d.ip||'--';document.getElementById('curSignal').textContent=formatSignal(Number(d.rssi));document.getElementById('curHost').textContent=d.host||'--';document.getElementById('curClock').textContent=formatClock(parseInt(d.epoch)||0);document.getElementById('curSync').textContent=d.ntp?t('synced'):t('unsynced');}catch(e){}}
 async function saveWifi(){const ssid=document.getElementById('ssidInput').value.trim();const pass=document.getElementById('passInput').value;if(!ssid){showToast(t('ssidReq'),'err');return;}try{const res=await fetch('/savewifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass)+'&noreset=1'});if(!res.ok)throw new Error('save');showToast(t('saved'),'ok');setTimeout(()=>{window.location='/';},2500);}catch(e){showToast(t('saveErr'),'err');}}
-function setLang(lang,persist=true,refreshStatus=true){LG=TR[lang]?lang:'es';localStorage.setItem('lang',LG);document.documentElement.lang=LG;document.getElementById('langSel').value=LG;document.getElementById('backBtn').textContent=t('back');document.getElementById('heroEyebrow').textContent=t('eyebrow');document.getElementById('heroTitle').textContent=t('title');document.getElementById('heroText').textContent=t('hero');document.getElementById('kSsid').textContent=t('ssidNow');document.getElementById('kIp').textContent=t('ipNow');document.getElementById('kSignal').textContent=t('signal');document.getElementById('kHost').textContent=t('host');document.getElementById('kClock').textContent=t('clock');document.getElementById('kSync').textContent=t('sync');document.getElementById('scanTitle').textContent=t('scanTitle');document.getElementById('scanBtn').textContent=t('scanBtn');document.getElementById('formTitle').textContent=t('formTitle');document.getElementById('lblSsid').textContent=t('lblSsid');document.getElementById('lblPass').textContent=t('lblPass');document.getElementById('saveBtn').textContent=t('save');document.getElementById('wifiNote').textContent=t('note');renderNetworks();if(refreshStatus)loadStatus();if(!scanResults.length){document.getElementById('scanMsg').textContent=t('scanRun');}if(persist)persistLang(LG);}
-window.addEventListener('load',()=>{setLang(LG);loadStatus();scanWifi();});
+function setLang(lang,persist=true,refreshStatus=true){LG=TR[lang]?lang:'es';localStorage.setItem('lang',LG);document.documentElement.lang=LG;document.getElementById('langSel').value=LG;document.getElementById('backBtn').textContent=t('back');document.getElementById('heroEyebrow').textContent=t('eyebrow');document.getElementById('heroTitle').textContent=t('title');document.getElementById('heroText').textContent=t('hero');document.getElementById('kSsid').textContent=t('ssidNow');document.getElementById('kIp').textContent=t('ipNow');document.getElementById('kSignal').textContent=t('signal');document.getElementById('kHost').textContent=t('host');document.getElementById('kClock').textContent=t('clock');document.getElementById('kSync').textContent=t('sync');document.getElementById('scanTitle').textContent=t('scanTitle');document.getElementById('scanBtn').textContent=t('scanBtn');document.getElementById('formTitle').textContent=t('formTitle');document.getElementById('lblSsid').textContent=t('lblSsid');document.getElementById('ssidInput').placeholder=t('ssidPh');document.getElementById('manualHint').textContent=t('manualHint');document.getElementById('lblPass').textContent=t('lblPass');document.getElementById('passInput').placeholder=t('passPh');document.getElementById('saveBtn').textContent=t('save');document.getElementById('wifiNote').textContent=t('note');renderNetworks();if(refreshStatus)loadStatus();if(!scanResults.length){document.getElementById('scanMsg').textContent=t('scanIdle');}if(persist)persistLang(LG);}
+window.addEventListener('load',()=>{setLang(LG);document.getElementById('ssidInput').addEventListener('input',renderNetworks);loadStatus();scanWifi();});
 </script></body></html>
 )rawliteral";
 
@@ -650,6 +981,7 @@ footer{text-align:center;color:#475569;font-size:.66rem;margin-top:16px}
     <button class="tbtn green" onclick="checkForUpdates(true)" id="btnUpdates"><span class="btn-ico">⬇️</span><span>Updates</span></button>
     <button class="tbtn blue" onclick="showOTA()" id="btnOTA"><span class="btn-ico">📦</span><span>OTA</span></button>
     <button class="tbtn orange" onclick="openWifiPage()" id="btnWifi"><span class="btn-ico">📶</span><span>WiFi</span></button>
+    <button class="tbtn blue" onclick="openSensorsPage()" id="btnSensors"><span class="btn-ico">⚙️</span><span>Config</span></button>
     <button class="tbtn green" onclick="confirmResetPeak()" id="btnResetPeak"><span class="btn-ico">🌡️</span><span>T.max</span></button>
     <button class="tbtn red" onclick="confirmRestart()" id="btnRestart"><span class="btn-ico">🔄</span><span>Reiniciar ESP</span></button>
   </div>
@@ -702,7 +1034,7 @@ function formatSignal(rssi){if(typeof rssi!=='number'||rssi<=-126)return netText
 function setSensorAlert(d){const el=document.getElementById('sensorAlert');if(!el)return;const t=TR[LG];const sc=parseInt(d.sc)||0;const s1ok=!!d.s1ok;const s2ok=!!d.s2ok;let msg='';if(sc===0){msg=t.sensAlertNone;}else if(!s1ok||!s2ok){const missing=[];if(!s1ok)missing.push(t.sensAlertZ1);if(!s2ok)missing.push(t.sensAlertZ2);msg=t.sensAlertMissing+' '+missing.join(' ');}el.innerHTML=msg?'<strong>DS18B20:</strong> '+msg:'';el.classList.toggle('show',!!msg);}
 function showOTA(){document.getElementById('otaOverlay').classList.add('show');}function hideOTA(){document.getElementById('otaOverlay').classList.remove('show');}function confirmRestart(){document.getElementById('rstOverlay').classList.add('show');}function hideRst(){document.getElementById('rstOverlay').classList.remove('show');}function confirmResetPeak(){document.getElementById('peakOverlay').classList.add('show');}function hidePeakRst(){document.getElementById('peakOverlay').classList.remove('show');}
 async function doResetPeak(){hidePeakRst();try{await fetch('/resetpeaks');}catch(e){}maxTemp={'1':null,'2':null};document.getElementById('mx1').textContent='--.-\u00b0C';document.getElementById('mx2').textContent='--.-\u00b0C';}
-async function doRestart(){hideRst();try{await fetch('/restart');}catch(e){}setTimeout(()=>location.reload(),6000);}function openWifiPage(){window.location='/wifi';}
+async function doRestart(){hideRst();try{await fetch('/restart');}catch(e){}setTimeout(()=>location.reload(),6000);}function openWifiPage(){window.location='/wifi';}function openSensorsPage(){window.location='/sensors';}
 async function checkForUpdates(manual){const t=TR[LG];try{const res=await fetch('https://api.github.com/repos/'+FW_REPO+'/releases/latest',{headers:{'Accept':'application/vnd.github+json'}});if(!res.ok)throw new Error('github');const rel=await res.json();const latest=rel.tag_name||rel.name||'';if(cmpVer(latest,FW_VER)<=0){if(manual)alert(t.upToDate+' ('+FW_VER+')');if(updateDismissedVersion&&cmpVer(updateDismissedVersion,latest)<=0){updateDismissedVersion='';localStorage.removeItem('updateDismissedVersion');}return;}if(!manual&&updateDismissedVersion&&normVer(updateDismissedVersion)===normVer(latest)){return;}const asset=(rel.assets||[]).find(a=>String(a.name||'').toLowerCase().endsWith('.bin'));const openUrl=asset&&asset.browser_download_url?asset.browser_download_url:rel.html_url;if(!asset&&manual)alert(t.updateOpenRelease);if(confirm(fmt(t.updateAvail,{latest:latest,current:FW_VER}))){window.open(openUrl,'_blank','noopener');updateDismissedVersion='';localStorage.removeItem('updateDismissedVersion');}else if(!manual){updateDismissedVersion=latest;localStorage.setItem('updateDismissedVersion',latest);}}catch(e){if(manual)alert(t.updateError);}}
 let histData={t1:[],t2:[]};let maxTemp={'1':null,'2':null};
 function drawChart(id,data,col){const cv=document.getElementById(id);if(!cv||!data||data.length<2)return;const W=cv.parentElement.clientWidth||260;const H=cv.parentElement.clientHeight||80;cv.width=W;cv.height=H;const ctx=cv.getContext('2d');ctx.clearRect(0,0,W,H);const N=data.length;const loV=Math.min(...data),hiV=Math.max(...data);const lo=Math.max(0,loV-5),hi=hiV+5,rng=hi-lo||1;const pH=12,pB=12;const toX=i=>(i/(N-1))*(W-2)+1;const toY=v=>H-pB-((v-lo)/rng)*(H-pH-pB);ctx.fillStyle='#0f172a';ctx.fillRect(0,0,W,H);for(let g=1;g<4;g++){const yg=H-pB-(g/3)*(H-pH-pB);ctx.strokeStyle='#1e3050';ctx.beginPath();ctx.moveTo(0,yg);ctx.lineTo(W,yg);ctx.stroke();ctx.fillStyle='#4b5563';ctx.font='8px monospace';ctx.fillText((lo+g/3*rng).toFixed(0)+'\u00b0',3,yg-2);}const grad=ctx.createLinearGradient(0,0,0,H);grad.addColorStop(0,col+'55');grad.addColorStop(1,col+'08');ctx.beginPath();data.forEach((v,i)=>{const y=toY(v);i===0?ctx.moveTo(toX(i),y):ctx.lineTo(toX(i),y);});ctx.lineTo(toX(N-1),H);ctx.lineTo(toX(0),H);ctx.closePath();ctx.fillStyle=grad;ctx.fill();ctx.beginPath();data.forEach((v,i)=>{const y=toY(v);i===0?ctx.moveTo(toX(i),y):ctx.lineTo(toX(i),y);});ctx.strokeStyle=col;ctx.lineWidth=2;ctx.lineJoin='round';ctx.stroke();const lx=toX(N-1),ly=toY(data[N-1]);ctx.beginPath();ctx.arc(lx,ly,3,0,Math.PI*2);ctx.fillStyle=col;ctx.fill();}
@@ -720,10 +1052,131 @@ window.addEventListener('load',()=>{setLang(LG);fetchHistory();refresh();setInte
 </script></body></html>
 )rawliteral";
 
+const char SENSORS_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Configuración</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1220;--card:#111827;--card2:#172033;--line:#24324a;--txt:#e5eefb;--muted:#8ea2bd;--blue:#3b82f6;--green:#16a34a}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#13203a,#0b1220 58%);font-family:Segoe UI,Arial,sans-serif;color:var(--txt)}.wrap{max-width:980px;margin:0 auto;padding:22px}.top{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center;margin-bottom:18px}.title h1{margin:0;font-size:1.5rem}.title p{margin:4px 0 0;color:var(--muted);font-size:.95rem}.actions{display:flex;gap:10px;flex-wrap:wrap}.btn{border:none;border-radius:10px;padding:11px 16px;font-weight:700;cursor:pointer}.btn-blue{background:var(--blue);color:#fff}.btn-green{background:var(--green);color:#fff}.btn-ghost{background:#1e293b;color:var(--txt);border:1px solid var(--line)}.panel{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 18px 36px #0005}.hint{color:var(--muted);margin:0 0 16px}.list{display:grid;gap:14px}.row{display:grid;grid-template-columns:1.3fr .7fr .8fr;gap:12px;align-items:center;padding:14px;border-radius:14px;background:#0d1628;border:1px solid #1f2b42}.addr{font-family:Consolas,monospace;font-size:.95rem;font-weight:700}.meta{font-size:.82rem;color:var(--muted);margin-top:4px}.temp{font-size:1.25rem;font-weight:800}.temp.bad{color:#fca5a5}.temp.ok{color:#7dd3fc}select{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:var(--txt)}.status{margin-top:14px;min-height:1.2rem;font-size:.92rem}.status.ok{color:#86efac}.status.err{color:#fca5a5}.empty{padding:22px;border-radius:14px;border:1px dashed #334155;background:#0f172a;color:var(--muted);text-align:center}@media (max-width:720px){.row{grid-template-columns:1fr}.actions{width:100%}.actions .btn{flex:1}}</style>
+</head><body><div class="wrap"><div class="top"><div class="title"><h1>Configuración</h1><p>Define qué sensor controla cada zona y qué salida física usa cada ventilador.</p></div><div class="actions"><button class="btn btn-ghost" onclick="window.location='/'">Volver</button><button class="btn btn-blue" onclick="refreshSensors(true)">Actualizar</button><button class="btn btn-green" onclick="saveAssignments()">Guardar configuración</button></div></div><div class="panel"><p class="hint">Cada sensor muestra su ROM ID y la temperatura actual. Usa el desplegable para dejarlo fijo en Drivers de Motores o Fuente de Alimentación.</p><div id="sensorList" class="list"></div><div class="status" style="margin-top:18px;font-weight:700">Salidas de ventilador</div><p class="hint">Asigna qué pin físico controla cada zona. Solo se permiten IO5 e IO6 y no se pueden repetir.</p><div id="fanOutputs" class="list"></div><div id="status" class="status"></div></div></div><script>
+let draft={};
+let fanPinDraft={zone1Pin:null,zone2Pin:null};
+let configDirty=false;
+function tempText(sensor){if(sensor.valid&&typeof sensor.temp==='number')return sensor.temp.toFixed(1)+'°C';return '--.-°C';}
+function tempClass(sensor){return sensor.valid?'temp ok':'temp bad';}
+function zoneOptions(selected){return `<option value="0" ${selected===0?'selected':''}>Sin asignar</option><option value="1" ${selected===1?'selected':''}>Drivers de Motores</option><option value="2" ${selected===2?'selected':''}>Fuente de Alimentación</option>`;}
+function pinOptions(selected){return `<option value="5" ${selected===5?'selected':''}>IO5</option><option value="6" ${selected===6?'selected':''}>IO6</option>`;}
+function hasPendingChanges(){return configDirty;}
+function syncPinSelectors(changedId){const zone1=document.getElementById('zone1Pin');const zone2=document.getElementById('zone2Pin');if(!zone1||!zone2)return;if(changedId==='zone1Pin'){zone2.value=zone1.value==='5'?'6':'5';}else if(changedId==='zone2Pin'){zone1.value=zone2.value==='5'?'6':'5';}fanPinDraft.zone1Pin=zone1.value;fanPinDraft.zone2Pin=zone2.value;configDirty=true;}
+function renderSensors(data){const root=document.getElementById('sensorList');if(!data.sensors||!data.sensors.length){root.innerHTML='<div class="empty">No se detecta ningún DS18B20 en GPIO4.</div>';return;}root.innerHTML=data.sensors.map((sensor,index)=>{const selected=draft[sensor.addr]!==undefined?parseInt(draft[sensor.addr],10):sensor.assigned;return `<div class="row"><div><div class="addr">${sensor.addr}</div><div class="meta">Sensor ${index+1}${sensor.assigned===1?' · asignado a Drivers':sensor.assigned===2?' · asignado a Fuente':''}</div></div><div class="${tempClass(sensor)}">${tempText(sensor)}</div><div><select data-addr="${sensor.addr}">${zoneOptions(selected)}</select></div></div>`;}).join('');document.querySelectorAll('select[data-addr]').forEach(sel=>{sel.addEventListener('change',()=>{draft[sel.dataset.addr]=sel.value;configDirty=true;});});}
+function renderFanOutputs(data){const zone1Selected=parseInt(fanPinDraft.zone1Pin!==null?fanPinDraft.zone1Pin:data.zone1OutputPin,10);const zone2Selected=parseInt(fanPinDraft.zone2Pin!==null?fanPinDraft.zone2Pin:data.zone2OutputPin,10);const root=document.getElementById('fanOutputs');root.innerHTML=`<div class="row"><div><div class="addr">Drivers de Motores</div><div class="meta">Salida del ventilador de la zona 1</div></div><div class="temp ok">GPIO</div><div><select id="zone1Pin">${pinOptions(zone1Selected)}</select></div></div><div class="row"><div><div class="addr">Fuente de Alimentación</div><div class="meta">Salida del ventilador de la zona 2</div></div><div class="temp ok">GPIO</div><div><select id="zone2Pin">${pinOptions(zone2Selected)}</select></div></div>`;const zone1=document.getElementById('zone1Pin');const zone2=document.getElementById('zone2Pin');zone1.addEventListener('change',()=>syncPinSelectors('zone1Pin'));zone2.addEventListener('change',()=>syncPinSelectors('zone2Pin'));fanPinDraft.zone1Pin=zone1.value;fanPinDraft.zone2Pin=zone2.value;}
+function setStatus(message,isError){const el=document.getElementById('status');el.textContent=message||'';el.className='status'+(message?(isError?' err':' ok'):'');}
+async function refreshSensors(force){if(hasPendingChanges()&&!force)return;try{const res=await fetch('/sensors/status');if(!res.ok)throw new Error('status');const data=await res.json();renderSensors(data);renderFanOutputs(data);if(!hasPendingChanges())setStatus('',false);}catch(e){setStatus('No se pudo leer la configuración.',true);}}
+async function saveAssignments(){const values={};document.querySelectorAll('select[data-addr]').forEach(sel=>{values[sel.dataset.addr]=sel.value;});const usedZones=new Set();let z1addr='',z2addr='';for(const [addr,zone] of Object.entries(values)){if(zone==='0')continue;if(usedZones.has(zone)){setStatus('Solo puede haber un sensor fijo por zona.',true);return;}usedZones.add(zone);if(zone==='1')z1addr=addr;else if(zone==='2')z2addr=addr;}const z1pin=document.getElementById('zone1Pin').value;const z2pin=document.getElementById('zone2Pin').value;if(z1pin===z2pin){setStatus('IO5 e IO6 no pueden quedar asignados a la misma zona.',true);return;}try{const body=new URLSearchParams({z1addr,z2addr,z1pin,z2pin});const res=await fetch('/sensors/assign',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});if(!res.ok)throw new Error(await res.text());draft={};fanPinDraft={zone1Pin:null,zone2Pin:null};configDirty=false;setStatus('Configuración guardada.',false);await refreshSensors(true);}catch(e){setStatus('No se pudo guardar la configuración.',true);}}
+window.addEventListener('load',()=>{refreshSensors(true);setInterval(()=>refreshSensors(false),3000);});
+</script></body></html>
+)rawliteral";
+
 // ─── Manejadores web ──────────────────────────────────────────────────────────
 void handleRoot()   { server.send_P(200, "text/html", HTML_PAGE); }
 void handleStatus() { server.send(200, F("application/json"), buildJson()); }
 void handleWifiPage() { server.send_P(200, "text/html", WIFI_PAGE); }
+void handleSensorsPage() { server.send_P(200, "text/html", SENSORS_PAGE); }
+void handleIndexHtml() { server.send_P(200, "text/html", HTML_PAGE); }
+
+String buildSensorsJson() {
+  String j;
+  j.reserve(720);
+  j += F("{\"sensors\":[");
+  for (int i = 0; i < detectedSensorCount; ++i) {
+    if (i > 0) j += ',';
+    const int assigned = deviceAddressEquals(detectedSensorAddrs[i], zone1SensorAddr)
+      ? 1
+      : (deviceAddressEquals(detectedSensorAddrs[i], zone2SensorAddr) ? 2 : 0);
+    j += F("{\"addr\":\"");
+    j += deviceAddressToString(detectedSensorAddrs[i]);
+    j += F("\",\"temp\":");
+    if (detectedSensorValids[i]) j += String(detectedSensorTemps[i], 1);
+    else j += F("null");
+    j += F(",\"valid\":");
+    j += detectedSensorValids[i] ? F("true") : F("false");
+    j += F(",\"assigned\":");
+    j += String(assigned);
+    j += '}';
+  }
+  j += F("],\"zone1OutputPin\":");
+  j += String(zone1OutputPin);
+  j += F(",\"zone2OutputPin\":");
+  j += String(zone2OutputPin);
+  j += F("}");
+  return j;
+}
+
+void handleSensorsStatus() {
+  refreshDetectedSensors();
+  sensors.requestTemperatures();
+  for (int i = 0; i < detectedSensorCount; ++i) {
+    const float reading = sensors.getTempC(detectedSensorAddrs[i]);
+    detectedSensorTemps[i] = reading;
+    detectedSensorValids[i] = (reading != DEVICE_DISCONNECTED_C) && !isBootPlaceholderReading(reading);
+  }
+  server.send(200, F("application/json"), buildSensorsJson());
+}
+
+void handleSensorsAssign() {
+  const String z1 = server.hasArg("z1addr") ? server.arg("z1addr") : String();
+  const String z2 = server.hasArg("z2addr") ? server.arg("z2addr") : String();
+  const uint8_t nextZone1Pin = server.hasArg("z1pin") ? static_cast<uint8_t>(server.arg("z1pin").toInt()) : zone1OutputPin;
+  const uint8_t nextZone2Pin = server.hasArg("z2pin") ? static_cast<uint8_t>(server.arg("z2pin").toInt()) : zone2OutputPin;
+  DeviceAddress nextZone1;
+  DeviceAddress nextZone2;
+  clearDeviceAddress(nextZone1);
+  clearDeviceAddress(nextZone2);
+
+  if (z1.length() > 0 && !parseDeviceAddressString(z1, nextZone1)) {
+    server.send(400, "text/plain", "Direccion zona 1 invalida");
+    return;
+  }
+  if (z2.length() > 0 && !parseDeviceAddressString(z2, nextZone2)) {
+    server.send(400, "text/plain", "Direccion zona 2 invalida");
+    return;
+  }
+  if (isDeviceAddressAssigned(nextZone1) && isDeviceAddressAssigned(nextZone2) && deviceAddressEquals(nextZone1, nextZone2)) {
+    server.send(400, "text/plain", "No se puede asignar el mismo sensor a las dos zonas");
+    return;
+  }
+  if (!isValidFanOutputPin(nextZone1Pin) || !isValidFanOutputPin(nextZone2Pin) || nextZone1Pin == nextZone2Pin) {
+    server.send(400, "text/plain", "Asignacion de salidas invalida");
+    return;
+  }
+
+  refreshDetectedSensors();
+  if (isDeviceAddressAssigned(nextZone1) && findDetectedSensorIndex(nextZone1) < 0) {
+    server.send(400, "text/plain", "El sensor de la zona 1 no esta detectado");
+    return;
+  }
+  if (isDeviceAddressAssigned(nextZone2) && findDetectedSensorIndex(nextZone2) < 0) {
+    server.send(400, "text/plain", "El sensor de la zona 2 no esta detectado");
+    return;
+  }
+
+  copyDeviceAddress(zone1SensorAddr, nextZone1);
+  copyDeviceAddress(zone2SensorAddr, nextZone2);
+  zone1OutputPin = nextZone1Pin;
+  zone2OutputPin = nextZone2Pin;
+  saveSensorAssignments();
+  saveOutputAssignments();
+  controlFans();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSsdpDescription() {
+  const char* schema = SSDP.getSchema();
+  if (!schema) {
+    server.send(503, F("text/plain"), F("SSDP schema unavailable"));
+    return;
+  }
+  server.send(200, F("text/xml"), schema);
+}
 
 void handleWifiScan() {
   const int n = WiFi.scanNetworks(false, true);
@@ -830,6 +1283,8 @@ void handleSaveWifi() {
           "<body><h2 style='color:#60a5fa'>&#128274; Guardado</h2>"
           "<p style='margin-top:12px'>Reiniciando y conectando a la nueva red...</p>"
           "</body></html>"));
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
     delay(1500);
     ESP.restart();
 }
@@ -856,6 +1311,7 @@ void setup() {
     delay(100);
     Serial.println(F("\n=== Snapmaker U1 Fan Controller 24V · ESP32-C3 ==="));
   Serial.printf("Firmware version: v%s\n", FW_VERSION);
+    WiFi.persistent(false);
     Serial.print(F("MAC ESP32: "));
     Serial.println(WiFi.macAddress());
 
@@ -867,6 +1323,7 @@ void setup() {
     // EEPROM
     EEPROM.begin(EEPROM_SIZE);
     loadLanguagePref();
+    loadOutputAssignments();
     loadSettings();
     loadPeakTemps();
     Serial.printf("Z1: %s  Z2: %s\n", z1Auto ? "AUTO" : "MANUAL", z2Auto ? "AUTO" : "MANUAL");
@@ -874,11 +1331,13 @@ void setup() {
     // DS18B20
     sensors.begin();
     const int found = sensors.getDeviceCount();
-    Serial.printf("DS18B20: %d sensor(es)\n", found);
-    sensor1Valid = (found >= 1);
-    sensor2Valid = (found >= 1);
-    if (found >= 1) { sensors.getAddress(addr1, 0); sensors.setResolution(addr1, 11); }
-    if (found >= 2) { sensors.getAddress(addr2, 1); sensors.setResolution(addr2, 11); twoSensors = true; sensor2Valid = true; }
+    refreshDetectedSensors();
+    Serial.printf("DS18B20: %d sensor(es)\n", detectedSensorCount);
+    loadSensorAssignments();
+    sensor1Valid = (detectedSensorCount >= 1);
+    sensor2Valid = (detectedSensorCount >= 1);
+    if (detectedSensorCount >= 1) copyDeviceAddress(addr1, detectedSensorAddrs[0]);
+    if (detectedSensorCount >= 2) { copyDeviceAddress(addr2, detectedSensorAddrs[1]); sensor2Valid = true; }
     else Serial.println(F("AVISO: zona 2 usara la misma lectura que zona 1"));
 
     // Credenciales WiFi
@@ -888,14 +1347,21 @@ void setup() {
     if (!hasWifi) {
       // ── MODO AP ──────────────────────────────────────────────────────────
       apMode = true;
+      stopMdnsIfNeeded();
+      stopNbnsIfNeeded();
+      stopSsdpIfNeeded();
       Serial.println(F("Sin credenciales WiFi → modo AP 'SnapFan-Setup'"));
       WiFi.mode(WIFI_AP_STA);
+      applyWifiHostname();
       WiFi.softAP("SnapFan-Setup");
       delay(1000); // Esperar a que la IP esté lista
       Serial.print(F("IP AP: ")); Serial.println(WiFi.softAPIP());
       dnsServer.start(53, "*", WiFi.softAPIP());
       server.on("/", HTTP_GET,  []() { server.send_P(200, "text/html", AP_PAGE); });
       server.on("/wifi", HTTP_GET, handleWifiPage);
+      server.on("/sensors", HTTP_GET, handleSensorsPage);
+      server.on("/sensors/status", HTTP_GET, handleSensorsStatus);
+      server.on("/sensors/assign", HTTP_POST, handleSensorsAssign);
       server.on("/wifi/scan", HTTP_GET, handleWifiScan);
       server.on("/status", HTTP_GET, handleStatus);
       server.on("/setlang", HTTP_GET, handleSetLang);
@@ -909,21 +1375,27 @@ void setup() {
     } else {
       // ── MODO NORMAL ──────────────────────────────────────────────────────
       Serial.printf("Conectando a '%s'\n", wifiSSID);
-      WiFi.mode(WIFI_STA);
-      WiFi.setHostname(DEVICE_HOSTNAME);
-      WiFi.begin(wifiSSID, wifiPass);
+      beginWifiStation(wifiSSID, wifiPass);
       const unsigned long wStart = millis();
       while (WiFi.status() != WL_CONNECTED && (millis() - wStart) < 15000UL) {
         delay(500); Serial.print('.');
       }
       Serial.println();
       if (WiFi.status() == WL_CONNECTED) {
+        beginMdnsIfNeeded();
+        beginNbnsIfNeeded();
+        beginSsdpIfNeeded();
         Serial.printf("Conectado! IP: %s\n", WiFi.localIP().toString().c_str());
       } else {
         Serial.println(F("WiFi no disponible. Reintentando en loop..."));
       }
       server.on("/",         HTTP_GET, handleRoot);
+      server.on("/index.html", HTTP_GET, handleIndexHtml);
+      server.on("/description.xml", HTTP_GET, handleSsdpDescription);
       server.on("/wifi",     HTTP_GET, handleWifiPage);
+      server.on("/sensors", HTTP_GET, handleSensorsPage);
+      server.on("/sensors/status", HTTP_GET, handleSensorsStatus);
+      server.on("/sensors/assign", HTTP_POST, handleSensorsAssign);
       server.on("/wifi/scan", HTTP_GET, handleWifiScan);
       server.on("/status",   HTTP_GET, handleStatus);
       server.on("/setlang",  HTTP_GET, handleSetLang);
@@ -954,21 +1426,38 @@ void setup() {
     if (millis() - lastTempMs < TEMP_MS) return;
     lastTempMs = millis();
 
+    refreshDetectedSensors();
     sensors.requestTemperatures();
-    const float r1 = twoSensors ? sensors.getTempC(addr1) : sensors.getTempCByIndex(0);
-    sensor1Valid = (r1 != DEVICE_DISCONNECTED_C) && (sensor1Ready || !isBootPlaceholderReading(r1));
-    if (sensor1Valid) {
-      temp1 = r1;
-      sensor1Ready = true;
+    for (int i = 0; i < detectedSensorCount; ++i) {
+      const float reading = sensors.getTempC(detectedSensorAddrs[i]);
+      detectedSensorTemps[i] = reading;
+      detectedSensorValids[i] = (reading != DEVICE_DISCONNECTED_C) && !isBootPlaceholderReading(reading);
     }
 
-    const float r2 = twoSensors ? sensors.getTempC(addr2) : temp1;
-    sensor2Valid = twoSensors
-      ? ((r2 != DEVICE_DISCONNECTED_C) && (sensor2Ready || !isBootPlaceholderReading(r2)))
-      : sensor1Valid;
-    if (sensor2Valid) {
-      temp2 = r2;
-      sensor2Ready = twoSensors ? true : sensor1Ready;
+    int zone1Index = -1;
+    int zone2Index = -1;
+    resolveZoneSensorIndices(zone1Index, zone2Index);
+
+    if (zone1Index >= 0) {
+      const float r1 = detectedSensorTemps[zone1Index];
+      sensor1Valid = (r1 != DEVICE_DISCONNECTED_C) && (sensor1Ready || !isBootPlaceholderReading(r1));
+      if (sensor1Valid) {
+        temp1 = r1;
+        sensor1Ready = true;
+      }
+    } else {
+      sensor1Valid = false;
+    }
+
+    if (zone2Index >= 0) {
+      const float r2 = detectedSensorTemps[zone2Index];
+      sensor2Valid = (r2 != DEVICE_DISCONNECTED_C) && (sensor2Ready || !isBootPlaceholderReading(r2));
+      if (sensor2Valid) {
+        temp2 = r2;
+        sensor2Ready = true;
+      }
+    } else {
+      sensor2Valid = false;
     }
 
     hist1[histIdx] = temp1;
@@ -989,6 +1478,8 @@ void setup() {
 void loop() {
   updateTemperatures();
 
+    static bool announced = false;
+
     if (apMode) {
         dnsServer.processNextRequest();
         server.handleClient();
@@ -1000,19 +1491,25 @@ void loop() {
 
     // Watchdog WiFi
     if (WiFi.status() != WL_CONNECTED) {
+      stopMdnsIfNeeded();
+      stopNbnsIfNeeded();
+      stopSsdpIfNeeded();
+        announced = false;
         static unsigned long lastW = 0;
         if (millis() - lastW >= 10000UL) {
             lastW = millis();
             char ssid[33] = {0}, pass[65] = {0};
             loadWifiCreds(ssid, pass);
-            WiFi.disconnect(); WiFi.begin(ssid, pass);
+        beginWifiStation(ssid, pass);
         }
         return;
     }
 
-    static bool announced = false;
     if (!announced) {
         announced = true;
+      beginMdnsIfNeeded();
+      beginNbnsIfNeeded();
+      beginSsdpIfNeeded();
         Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
     }
 

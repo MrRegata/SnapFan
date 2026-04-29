@@ -8,17 +8,17 @@ Esta guía sirve para grabar el firmware SnapFan en la placa por USB usando Plat
 - Extensión PlatformIO IDE instalada en VS Code
 - Python y dependencias que instala PlatformIO automáticamente
 - Cable USB de datos conectado al ESP32-C3
-- Puerto serie correcto disponible, en este proyecto: COM6
+- Puerto serie correcto disponible, en este proyecto: COM12
 
 ## Configuración actual del proyecto
 
 - Entorno PlatformIO: esp32c3
 - Placa: esp32-c3-devkitm-1
 - Framework: arduino
-- Puerto de subida: COM6
-- Puerto de monitor: COM6
+- Puerto de subida: COM12
+- Puerto de monitor: COM12
 - Velocidad de monitor: 115200
-- Versión actual del firmware: 0.5.0
+- Versión actual del firmware: 0.5.1
 
 ## Librerías necesarias
 
@@ -33,8 +33,8 @@ Dependencias declaradas:
 ## Preparación del hardware
 
 - Conecta el ESP32-C3 por USB al PC.
-- Asegúrate de que Windows lo detecta como COM6, o ajusta platformio.ini si cambia de puerto.
-- Cierra cualquier monitor serie o programa que esté usando COM6 antes de subir el firmware.
+- Asegúrate de que Windows lo detecta como COM12, o ajusta platformio.ini si cambia de puerto.
+- Cierra cualquier monitor serie o programa que esté usando COM12 antes de subir el firmware.
 
 ## Cargar el firmware desde VS Code
 
@@ -44,7 +44,7 @@ Dependencias declaradas:
 4. Ejecuta este comando:
 
 ```powershell
-platformio run -e esp32c3 --target upload --upload-port COM6 -j 1
+platformio run -e esp32c3 --target upload --upload-port COM12 -j 1
 ```
 
 5. Espera al mensaje final SUCCESS.
@@ -60,22 +60,22 @@ platformio run -e esp32c3 --target upload --upload-port COM6 -j 1
 Después de grabar, puedes abrir el monitor serie con:
 
 ```powershell
-platformio device monitor --port COM6 --baud 115200 --filter time
+platformio device monitor --port COM12 --baud 115200 --filter time
 ```
 
 Mensajes útiles esperados:
 
-- Firmware version: v0.5.0
+- Firmware version: v0.5.1
 - DS18B20: X sensor(es)
 - Temperaturas -> Z1: ... C | Z2: ... C
 
 ## Problemas habituales
 
-### COM6 ocupado
+### COM12 ocupado
 
 Síntoma:
 
-- Acceso denegado al abrir COM6
+- Acceso denegado al abrir COM12
 
 Solución:
 
@@ -98,7 +98,7 @@ Incidencia real ya observada en este proyecto:
 Cuando la compilación termina correctamente, el script de versionado crea además este archivo:
 
 ```text
-.pio/build/esp32c3/snapfan-esp32c3-v0.5.0.bin
+.pio/build/esp32c3/snapfan-esp32c3-v0.5.1.bin
 ```
 
 Ese es el archivo que se publica en GitHub Releases para actualización OTA.

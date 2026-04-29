@@ -7,14 +7,18 @@ Control de ventiladores 24V para Snapmaker U1 con ESP32-C3, interfaz web y actua
 - Controla 2 zonas de ventiladores de 2 pines
 - Modo AUTO con umbral e histéresis
 - Modo MANUAL desde la web
+- Configuración web de sensores DS18B20 por ROM ID
+- Configuración web de la salida física de ventilador entre IO5 e IO6 por zona
+- Exploración WiFi con selección rápida de SSID y entrada manual
+- Descubrimiento en red por mDNS, NetBIOS y SSDP
 - OTA desde navegador
 - Publicación automática de firmware en GitHub Releases
 - Detección de nuevas versiones desde la web del ESP
 
 ## Release actual
 
-- Versión objetivo actual: v0.5.0.
-- Binario OTA esperado al compilar: `snapfan-esp32c3-v0.5.0.bin`.
+- Versión objetivo actual: v0.5.1.
+- Binario OTA esperado al compilar: `snapfan-esp32c3-v0.5.1.bin`.
 - Repo de releases OTA: `MrRegata/SnapFan`.
 
 ## Conexiones actuales
@@ -96,7 +100,7 @@ pero sin cargar el firmware por cable al ESP.
 Los binarios publicados se adjuntan a las releases de GitHub con este formato:
 
 - `snapfan-esp32c3-vX.Y.Z.bin`
-- `snapfan-esp32c3-v0.5.0.bin` para esta entrega
+- `snapfan-esp32c3-v0.5.1.bin` para esta entrega
 
 La web del ESP consulta el repo:
 
