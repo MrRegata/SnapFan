@@ -5,6 +5,7 @@ Control de ventiladores 24V para Snapmaker U1 con ESP32-C3, interfaz web y actua
 ## Qué hace
 
 - Controla 2 zonas de ventiladores de 2 pines
+- Puede leer el estado de Klipper a traves de Moonraker y reflejarlo en una tira WS2812
 - Modo AUTO con umbral e histéresis
 - Modo MANUAL desde la web
 - Configuración web de sensores DS18B20 por ROM ID
@@ -28,6 +29,22 @@ Control de ventiladores 24V para Snapmaker U1 con ESP32-C3, interfaz web y actua
 - GPIO5: salida al MOSFET de la zona 1.
 - GPIO6: salida al MOSFET de la zona 2.
 - GPIO7: LED de estado activo en LOW.
+- GPIO3: salida de datos para una tira WS2812/NeoPixel de estado de impresora.
+
+## Integracion con Klipper y tira LED
+
+- El firmware puede consultar Moonraker del host Klipper para leer el estado de impresion.
+- Estados contemplados en esta ampliacion: calentando, imprimiendo, pausada, finalizada, error, inactiva y offline.
+- Colores por defecto:
+	- calentando: naranja parpadeante
+	- imprimiendo: verde fijo
+	- pausada: amarillo parpadeante
+	- finalizada: azul fijo
+	- error: rojo parpadeante
+	- inactiva: azul tenue
+	- offline: morado tenue
+- Parametros a ajustar en [src/main.cpp](src/main.cpp): KLIPPER_HOST, KLIPPER_PORT, WLED_PIN y WLED_COUNT.
+- Conexion recomendada para la tira: DIN a GPIO3 con resistencia serie de 330 ohm, GND comun y alimentacion adecuada para la tira.
 
 ## Sensores y zonas
 

@@ -33,10 +33,12 @@
 #include <ESPmDNS.h>
 #include <ESP32SSDP.h>
 #include <NetBIOS.h>
+#include <HTTPClient.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <EEPROM.h>
 #include <PubSubClient.h>
+#include <Adafruit_NeoPixel.h>
 #include <time.h>
 
 extern "C" {
@@ -65,6 +67,8 @@ const char* NTP_SERVER_2 = "time.google.com";
 #define LED_PIN        7   // GPIO7 (ajustado, antes 2)
 #define MOSFET1_PIN    5   // GPIO5 salida zona 1
 #define MOSFET2_PIN    6   // GPIO6 salida zona 2
+#define WLED_PIN       3   // GPIO3 salida de datos para tira WS2812/WLED
+#define WLED_COUNT     8   // Ajustar al numero real de LEDs de la tira
 
 // ─── EEPROM layout ────────────────────────────────────────────────────────────
 #define EEPROM_SIZE      232
@@ -111,12 +115,28 @@ const char* MQTT_CLIENT_ID = "snapfan_esp12";
 #define TOPIC_STATUS  "snapfan/status"
 #define TOPIC_MODE    "snapfan/mode"
 
+const char* KLIPPER_HOST = "192.168.1.50";
+const uint16_t KLIPPER_PORT = 7125;
+const char* KLIPPER_QUERY_PATH = "/printer/objects/query?print_stats&idle_timeout&heater_bed&extruder";
+const unsigned long KLIPPER_POLL_MS = 3000UL;
+
 // ─── Estado ───────────────────────────────────────────────────────────────────
 bool apMode = false;
 bool timeConfigured = false;
 bool mdnsStarted = false;
 bool nbnsStarted = false;
 bool ssdpStarted = false;
+
+enum PrinterState {
+  PRINTER_STATE_UNKNOWN = 0,
+  PRINTER_STATE_IDLE,
+  PRINTER_STATE_HEATING,
+  PRINTER_STATE_PRINTING,
+  PRINTER_STATE_PAUSED,
+  PRINTER_STATE_COMPLETE,
+  PRINTER_STATE_ERROR,
+  PRINTER_STATE_OFFLINE
+};
 
 // ─── Parámetros de control ────────────────────────────────────────────────────
 bool  z1Auto = true, z2Auto = true;
@@ -161,6 +181,14 @@ int   histCount = 0;
 
 unsigned long lastTempMs = 0, lastMqttMs = 0;
 const unsigned long TEMP_MS = 3000UL, MQTT_MS = 5000UL;
+unsigned long lastKlipperPollMs = 0;
+unsigned long lastPrinterLedAnimMs = 0;
+bool printerLedPulseOn = false;
+PrinterState currentPrinterState = PRINTER_STATE_UNKNOWN;
+PrinterState previousPrinterState = PRINTER_STATE_UNKNOWN;
+String currentPrinterStateLabel = "unknown";
+
+Adafruit_NeoPixel printerStrip(WLED_COUNT, WLED_PIN, NEO_GRB + NEO_KHZ800);
 
 // ─── Rampa lineal + histéresis ────────────────────────────────────────────────
 // Solo ON/OFF según temperatura e histéresis
@@ -176,9 +204,165 @@ bool calcAutoFan(float t, float tHigh, float hyst, bool &fanOn) {
 bool applyWifiHostname();
 void refreshDetectedSensors();
 void loadOutputAssignments();
+void updatePrinterState();
+void updatePrinterLeds();
 
 bool isBootPlaceholderReading(float temperature) {
   return temperature > 84.5f && temperature < 85.5f;
+}
+
+String extractJsonStringValue(const String& json, const char* key) {
+  const String token = String("\"") + key + "\":\"";
+  const int start = json.indexOf(token);
+  if (start < 0) return String();
+  const int valueStart = start + token.length();
+  const int valueEnd = json.indexOf('"', valueStart);
+  if (valueEnd < 0) return String();
+  return json.substring(valueStart, valueEnd);
+}
+
+bool extractJsonFloatValue(const String& json, const char* key, float& outValue) {
+  const String token = String("\"") + key + "\":";
+  const int start = json.indexOf(token);
+  if (start < 0) return false;
+  int valueStart = start + token.length();
+  while (valueStart < static_cast<int>(json.length()) && json[valueStart] == ' ') ++valueStart;
+  int valueEnd = valueStart;
+  while (valueEnd < static_cast<int>(json.length())) {
+    const char c = json[valueEnd];
+    if (!(c == '-' || c == '+' || c == '.' || (c >= '0' && c <= '9'))) break;
+    ++valueEnd;
+  }
+  if (valueEnd == valueStart) return false;
+  outValue = json.substring(valueStart, valueEnd).toFloat();
+  return true;
+}
+
+PrinterState parsePrinterState(const String& stateValue, float bedTarget, float extruderTarget) {
+  if (stateValue == "printing") return PRINTER_STATE_PRINTING;
+  if (stateValue == "paused") return PRINTER_STATE_PAUSED;
+  if (stateValue == "complete") return PRINTER_STATE_COMPLETE;
+  if (stateValue == "cancelled" || stateValue == "error") return PRINTER_STATE_ERROR;
+  if (bedTarget > 35.0f || extruderTarget > 50.0f) return PRINTER_STATE_HEATING;
+  if (stateValue == "standby") return PRINTER_STATE_IDLE;
+  return PRINTER_STATE_IDLE;
+}
+
+const char* printerStateToString(PrinterState state) {
+  switch (state) {
+    case PRINTER_STATE_IDLE: return "idle";
+    case PRINTER_STATE_HEATING: return "heating";
+    case PRINTER_STATE_PRINTING: return "printing";
+    case PRINTER_STATE_PAUSED: return "paused";
+    case PRINTER_STATE_COMPLETE: return "complete";
+    case PRINTER_STATE_ERROR: return "error";
+    case PRINTER_STATE_OFFLINE: return "offline";
+    default: return "unknown";
+  }
+}
+
+uint32_t printerStateColor(PrinterState state) {
+  switch (state) {
+    case PRINTER_STATE_IDLE: return printerStrip.Color(0, 0, 24);
+    case PRINTER_STATE_HEATING: return printerStrip.Color(255, 80, 0);
+    case PRINTER_STATE_PRINTING: return printerStrip.Color(0, 180, 40);
+    case PRINTER_STATE_PAUSED: return printerStrip.Color(255, 180, 0);
+    case PRINTER_STATE_COMPLETE: return printerStrip.Color(0, 120, 255);
+    case PRINTER_STATE_ERROR: return printerStrip.Color(255, 0, 0);
+    case PRINTER_STATE_OFFLINE: return printerStrip.Color(64, 0, 64);
+    default: return printerStrip.Color(16, 16, 16);
+  }
+}
+
+void fillPrinterStrip(uint32_t color) {
+  for (uint16_t i = 0; i < printerStrip.numPixels(); ++i) {
+    printerStrip.setPixelColor(i, color);
+  }
+}
+
+void updatePrinterLeds() {
+  const unsigned long now = millis();
+  bool animate = false;
+  uint32_t color = printerStateColor(currentPrinterState);
+
+  if (currentPrinterState == PRINTER_STATE_HEATING || currentPrinterState == PRINTER_STATE_PAUSED || currentPrinterState == PRINTER_STATE_ERROR) {
+    animate = true;
+  }
+
+  if (!animate) {
+    fillPrinterStrip(color);
+    printerStrip.show();
+    return;
+  }
+
+  if (now - lastPrinterLedAnimMs < 350UL) return;
+  lastPrinterLedAnimMs = now;
+  printerLedPulseOn = !printerLedPulseOn;
+  fillPrinterStrip(printerLedPulseOn ? color : printerStrip.Color(0, 0, 0));
+  printerStrip.show();
+}
+
+void updatePrinterState() {
+  if (apMode || WiFi.status() != WL_CONNECTED) {
+    currentPrinterState = PRINTER_STATE_OFFLINE;
+    currentPrinterStateLabel = printerStateToString(currentPrinterState);
+    updatePrinterLeds();
+    return;
+  }
+
+  if (millis() - lastKlipperPollMs < KLIPPER_POLL_MS) {
+    updatePrinterLeds();
+    return;
+  }
+
+  lastKlipperPollMs = millis();
+
+  HTTPClient http;
+  String url = String("http://") + KLIPPER_HOST + ":" + String(KLIPPER_PORT) + KLIPPER_QUERY_PATH;
+  http.setConnectTimeout(1500);
+  http.setTimeout(1500);
+
+  if (!http.begin(url)) {
+    currentPrinterState = PRINTER_STATE_OFFLINE;
+    currentPrinterStateLabel = printerStateToString(currentPrinterState);
+    updatePrinterLeds();
+    return;
+  }
+
+  const int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    currentPrinterState = PRINTER_STATE_OFFLINE;
+    currentPrinterStateLabel = printerStateToString(currentPrinterState);
+    updatePrinterLeds();
+    return;
+  }
+
+  const String payload = http.getString();
+  http.end();
+
+  const String printState = extractJsonStringValue(payload, "state");
+  float bedTarget = 0.0f;
+  float extruderTarget = 0.0f;
+  extractJsonFloatValue(payload, "target", bedTarget);
+  const int secondTargetPos = payload.indexOf("\"target\":", payload.indexOf("\"heater_bed\""));
+  if (secondTargetPos >= 0) {
+    const String tail = payload.substring(secondTargetPos);
+    extractJsonFloatValue(tail, "target", bedTarget);
+  }
+  const int extruderPos = payload.indexOf("\"extruder\"");
+  if (extruderPos >= 0) {
+    const String tail = payload.substring(extruderPos);
+    extractJsonFloatValue(tail, "target", extruderTarget);
+  }
+
+  previousPrinterState = currentPrinterState;
+  currentPrinterState = parsePrinterState(printState, bedTarget, extruderTarget);
+  currentPrinterStateLabel = printerStateToString(currentPrinterState);
+  if (currentPrinterState != previousPrinterState) {
+    printerLedPulseOn = false;
+  }
+  updatePrinterLeds();
 }
 
 bool isSupportedLanguageCode(const char* code) {
@@ -583,7 +767,7 @@ bool applyWifiHostname() {
 
 // ─── JSON de estado ───────────────────────────────────────────────────────────
 String buildJson() {
-  String j; j.reserve(672);
+  String j; j.reserve(768);
     const bool wifiConnected = WiFi.status() == WL_CONNECTED;
     const int sensorCount = detectedSensorCount;
     const String wifiSsid = wifiConnected ? WiFi.SSID() : String();
@@ -626,6 +810,7 @@ String buildJson() {
       j += F(",\"ver\":\""); j += FW_VERSION;
       j += F("\",\"repo\":\""); j += FW_GITHUB_REPO;
       j += F("\",\"lang\":\""); j += currentLang;
+      j += F("\",\"printerState\":\""); j += currentPrinterStateLabel;
       j += F("\"");
     j += F("}");
     return j;
@@ -1319,6 +1504,10 @@ void setup() {
     pinMode(MOSFET1_PIN, OUTPUT); digitalWrite(MOSFET1_PIN, LOW);
     pinMode(MOSFET2_PIN, OUTPUT); digitalWrite(MOSFET2_PIN, LOW);
     pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, HIGH);
+    printerStrip.begin();
+    printerStrip.setBrightness(48);
+    fillPrinterStrip(printerStateColor(PRINTER_STATE_UNKNOWN));
+    printerStrip.show();
 
     // EEPROM
     EEPROM.begin(EEPROM_SIZE);
@@ -1477,6 +1666,7 @@ void setup() {
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
   updateTemperatures();
+  updatePrinterState();
 
     static bool announced = false;
 
