@@ -33,7 +33,6 @@
 #include <ESPmDNS.h>
 #include <ESP32SSDP.h>
 #include <NetBIOS.h>
-#include <HTTPClient.h>
 #include <esp32-hal-rgb-led.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -209,6 +208,7 @@ void refreshDetectedSensors();
 void loadOutputAssignments();
 void updatePrinterState();
 void updatePrinterLeds();
+bool fetchKlipperPayload(String& payload);
 
 bool isBootPlaceholderReading(float temperature) {
   return temperature > 84.5f && temperature < 85.5f;
@@ -301,6 +301,42 @@ void updatePrinterLeds() {
   writePrinterLed(printerLedPulseOn ? color : RgbColor{0, 0, 0});
 }
 
+bool fetchKlipperPayload(String& payload) {
+  WiFiClient client;
+  client.setTimeout(1500);
+  if (!client.connect(KLIPPER_HOST, KLIPPER_PORT)) {
+    return false;
+  }
+
+  client.print(String("GET ") + KLIPPER_QUERY_PATH + " HTTP/1.0\r\n");
+  client.print(String("Host: ") + KLIPPER_HOST + "\r\n");
+  client.print(F("Connection: close\r\n\r\n"));
+
+  unsigned long deadline = millis() + 1500UL;
+  while (!client.available() && millis() < deadline) {
+    delay(1);
+  }
+  if (!client.available()) {
+    client.stop();
+    return false;
+  }
+
+  const String statusLine = client.readStringUntil('\n');
+  if (statusLine.indexOf("200") < 0) {
+    client.stop();
+    return false;
+  }
+
+  while (client.connected()) {
+    const String line = client.readStringUntil('\n');
+    if (line == "\r" || line.length() == 0) break;
+  }
+
+  payload = client.readString();
+  client.stop();
+  return payload.length() > 0;
+}
+
 void updatePrinterState() {
   if (apMode || WiFi.status() != WL_CONNECTED) {
     currentPrinterState = PRINTER_STATE_OFFLINE;
@@ -315,30 +351,13 @@ void updatePrinterState() {
   }
 
   lastKlipperPollMs = millis();
-
-  HTTPClient http;
-  String url = String("http://") + KLIPPER_HOST + ":" + String(KLIPPER_PORT) + KLIPPER_QUERY_PATH;
-  http.setConnectTimeout(1500);
-  http.setTimeout(1500);
-
-  if (!http.begin(url)) {
+  String payload;
+  if (!fetchKlipperPayload(payload)) {
     currentPrinterState = PRINTER_STATE_OFFLINE;
     currentPrinterStateLabel = printerStateToString(currentPrinterState);
     updatePrinterLeds();
     return;
   }
-
-  const int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    http.end();
-    currentPrinterState = PRINTER_STATE_OFFLINE;
-    currentPrinterStateLabel = printerStateToString(currentPrinterState);
-    updatePrinterLeds();
-    return;
-  }
-
-  const String payload = http.getString();
-  http.end();
 
   const String printState = extractJsonStringValue(payload, "state");
   float bedTarget = 0.0f;
