@@ -34,11 +34,11 @@
 #include <ESP32SSDP.h>
 #include <NetBIOS.h>
 #include <HTTPClient.h>
+#include <esp32-hal-rgb-led.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <EEPROM.h>
 #include <PubSubClient.h>
-#include <Adafruit_NeoPixel.h>
 #include <time.h>
 
 extern "C" {
@@ -67,8 +67,7 @@ const char* NTP_SERVER_2 = "time.google.com";
 #define LED_PIN        7   // GPIO7 (ajustado, antes 2)
 #define MOSFET1_PIN    5   // GPIO5 salida zona 1
 #define MOSFET2_PIN    6   // GPIO6 salida zona 2
-#define WLED_PIN       3   // GPIO3 salida de datos para tira WS2812/WLED
-#define WLED_COUNT     8   // Ajustar al numero real de LEDs de la tira
+#define WLED_PIN       3   // GPIO3 salida de datos para un LED WS2812 de estado
 
 // ─── EEPROM layout ────────────────────────────────────────────────────────────
 #define EEPROM_SIZE      232
@@ -188,7 +187,11 @@ PrinterState currentPrinterState = PRINTER_STATE_UNKNOWN;
 PrinterState previousPrinterState = PRINTER_STATE_UNKNOWN;
 String currentPrinterStateLabel = "unknown";
 
-Adafruit_NeoPixel printerStrip(WLED_COUNT, WLED_PIN, NEO_GRB + NEO_KHZ800);
+struct RgbColor {
+  uint8_t red;
+  uint8_t green;
+  uint8_t blue;
+};
 
 // ─── Rampa lineal + histéresis ────────────────────────────────────────────────
 // Solo ON/OFF según temperatura e histéresis
@@ -261,45 +264,41 @@ const char* printerStateToString(PrinterState state) {
   }
 }
 
-uint32_t printerStateColor(PrinterState state) {
+RgbColor printerStateColor(PrinterState state) {
   switch (state) {
-    case PRINTER_STATE_IDLE: return printerStrip.Color(0, 0, 24);
-    case PRINTER_STATE_HEATING: return printerStrip.Color(255, 80, 0);
-    case PRINTER_STATE_PRINTING: return printerStrip.Color(0, 180, 40);
-    case PRINTER_STATE_PAUSED: return printerStrip.Color(255, 180, 0);
-    case PRINTER_STATE_COMPLETE: return printerStrip.Color(0, 120, 255);
-    case PRINTER_STATE_ERROR: return printerStrip.Color(255, 0, 0);
-    case PRINTER_STATE_OFFLINE: return printerStrip.Color(64, 0, 64);
-    default: return printerStrip.Color(16, 16, 16);
+    case PRINTER_STATE_IDLE: return {0, 0, 24};
+    case PRINTER_STATE_HEATING: return {255, 80, 0};
+    case PRINTER_STATE_PRINTING: return {0, 180, 40};
+    case PRINTER_STATE_PAUSED: return {255, 180, 0};
+    case PRINTER_STATE_COMPLETE: return {0, 120, 255};
+    case PRINTER_STATE_ERROR: return {255, 0, 0};
+    case PRINTER_STATE_OFFLINE: return {64, 0, 64};
+    default: return {16, 16, 16};
   }
 }
 
-void fillPrinterStrip(uint32_t color) {
-  for (uint16_t i = 0; i < printerStrip.numPixels(); ++i) {
-    printerStrip.setPixelColor(i, color);
-  }
+void writePrinterLed(const RgbColor& color) {
+  rgbLedWriteOrdered(WLED_PIN, LED_COLOR_ORDER_GRB, color.red, color.green, color.blue);
 }
 
 void updatePrinterLeds() {
   const unsigned long now = millis();
   bool animate = false;
-  uint32_t color = printerStateColor(currentPrinterState);
+  const RgbColor color = printerStateColor(currentPrinterState);
 
   if (currentPrinterState == PRINTER_STATE_HEATING || currentPrinterState == PRINTER_STATE_PAUSED || currentPrinterState == PRINTER_STATE_ERROR) {
     animate = true;
   }
 
   if (!animate) {
-    fillPrinterStrip(color);
-    printerStrip.show();
+    writePrinterLed(color);
     return;
   }
 
   if (now - lastPrinterLedAnimMs < 350UL) return;
   lastPrinterLedAnimMs = now;
   printerLedPulseOn = !printerLedPulseOn;
-  fillPrinterStrip(printerLedPulseOn ? color : printerStrip.Color(0, 0, 0));
-  printerStrip.show();
+  writePrinterLed(printerLedPulseOn ? color : RgbColor{0, 0, 0});
 }
 
 void updatePrinterState() {
@@ -1504,10 +1503,7 @@ void setup() {
     pinMode(MOSFET1_PIN, OUTPUT); digitalWrite(MOSFET1_PIN, LOW);
     pinMode(MOSFET2_PIN, OUTPUT); digitalWrite(MOSFET2_PIN, LOW);
     pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, HIGH);
-    printerStrip.begin();
-    printerStrip.setBrightness(48);
-    fillPrinterStrip(printerStateColor(PRINTER_STATE_UNKNOWN));
-    printerStrip.show();
+    writePrinterLed(printerStateColor(PRINTER_STATE_UNKNOWN));
 
     // EEPROM
     EEPROM.begin(EEPROM_SIZE);
